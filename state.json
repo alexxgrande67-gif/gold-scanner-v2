@@ -32,6 +32,7 @@
     "AIUSDT|4H|H|1795420800|0.01676|1795510200",
     "AIUSDT|4H|H|1795420800|0.01676|1795510800",
     "AIUSDT|4H|H|1795420800|0.01676|1795511400",
+    "AKEUSDT|4H|L|1793894400|0.001888|1795528200",
     "AKEUSDT|L|1794412800|0.002373|1795438200",
     "AKEUSDT|L|1794412800|0.002373|1795438800",
     "ALABUSDT|4H|H|1795435200|222|1795464900",
@@ -1374,5 +1375,101 @@
     "ZORAUSDT",
     "ZROUSDT",
     "ZRXUSDT"
-  ]
+  ],
+  "impulse_alerts": {
+    "AKEUSDT": {
+      "1D": {
+        "pct": 83.99,
+        "direction": "DUMP",
+        "sent_at": 1795528862
+      },
+      "4H": {
+        "pct": 30.2,
+        "direction": "DUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "DGAIUSDT": {
+      "1D": {
+        "pct": 63.05,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "IRYSUSDT": {
+      "1D": {
+        "pct": 77.38,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "MMTUSDT": {
+      "1D": {
+        "pct": 164.48,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      },
+      "4H": {
+        "pct": 44.4,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "NESUSDT": {
+      "1D": {
+        "pct": 70.87,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "PIEVERSEUSDT": {
+      "1D": {
+        "pct": 169.8,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "PIPPINUSDT": {
+      "1D": {
+        "pct": 104.77,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "PROSUSDT": {
+      "4H": {
+        "pct": 26.12,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "SNDKUSDT": {
+      "1D": {
+        "pct": 89.96,
+        "direction": "DUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "UPUSDT": {
+      "1D": {
+        "pct": 59.35,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "UVXYUSDT": {
+      "1D": {
+        "pct": 53.8,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    },
+    "YBUSDT": {
+      "1D": {
+        "pct": 57.57,
+        "direction": "PUMP",
+        "sent_at": 1795528862
+      }
+    }
+  }
 }
