@@ -64,8 +64,8 @@ DAILY_IMPULSE_MIN_PCT = 50.0
 FOUR_HOUR_IMPULSE_MIN_PCT = 25.0
 # Measure a recent impulse from the first candle's open to the furthest
 # high/low reached inside each rolling window.
-DAILY_IMPULSE_LOOKBACK = 7       # last 7 daily candles
-FOUR_HOUR_IMPULSE_LOOKBACK = 6   # last 6 four-hour candles (24 hours)
+DAILY_IMPULSE_LOOKBACK = 5       # last 5 daily candles (5 days)
+FOUR_HOUR_IMPULSE_LOOKBACK = 2   # last 2 four-hour candles (8 hours)
 IMPULSE_REPEAT_STEP_PCT = 20.0   # resend after an additional 20 percentage points
 DAILY_CHART_CANDLES = 90
 FOUR_HOUR_CHART_CANDLES = 72
@@ -420,7 +420,7 @@ def _impulse_details(bars, lookback):
 
 
 def _measure_symbol_impulses(exchange, symbol):
-    """Measure 7D and 24H(6x4H) impulses independently."""
+    """Measure 5D and 8H(2x4H) impulses independently."""
     daily = None
     four_hour = None
 
@@ -473,8 +473,8 @@ def build_stable_universe():
     measured = []
     print(
         f"[UNIVERSE] Liquidity preselection: {len(candidates)} contracts; "
-        f"checking {DAILY_IMPULSE_LOOKBACK} daily candles and "
-        f"{FOUR_HOUR_IMPULSE_LOOKBACK} 4H candles...",
+        f"checking {DAILY_IMPULSE_LOOKBACK} daily candles (5 days) and "
+        f"{FOUR_HOUR_IMPULSE_LOOKBACK} 4H candles (8 hours)...",
         flush=True
     )
 
@@ -1593,18 +1593,139 @@ def _png_chunk(chunk_type, data):
     return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
 
 
-def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620):
-    """Render a compact candlestick chart using only the Python standard library."""
+
+# 5x7 bitmap font used for chart headers (standard library only).
+_FONT_5X7 = {
+"A":["01110","10001","10001","11111","10001","10001","10001"],
+"B":["11110","10001","10001","11110","10001","10001","11110"],
+"C":["01111","10000","10000","10000","10000","10000","01111"],
+"D":["11110","10001","10001","10001","10001","10001","11110"],
+"E":["11111","10000","10000","11110","10000","10000","11111"],
+"F":["11111","10000","10000","11110","10000","10000","10000"],
+"G":["01111","10000","10000","10111","10001","10001","01111"],
+"H":["10001","10001","10001","11111","10001","10001","10001"],
+"I":["11111","00100","00100","00100","00100","00100","11111"],
+"J":["00111","00010","00010","00010","10010","10010","01100"],
+"K":["10001","10010","10100","11000","10100","10010","10001"],
+"L":["10000","10000","10000","10000","10000","10000","11111"],
+"M":["10001","11011","10101","10101","10001","10001","10001"],
+"N":["10001","11001","10101","10011","10001","10001","10001"],
+"O":["01110","10001","10001","10001","10001","10001","01110"],
+"P":["11110","10001","10001","11110","10000","10000","10000"],
+"Q":["01110","10001","10001","10001","10101","10010","01101"],
+"R":["11110","10001","10001","11110","10100","10010","10001"],
+"S":["01111","10000","10000","01110","00001","00001","11110"],
+"T":["11111","00100","00100","00100","00100","00100","00100"],
+"U":["10001","10001","10001","10001","10001","10001","01110"],
+"V":["10001","10001","10001","10001","10001","01010","00100"],
+"W":["10001","10001","10001","10101","10101","10101","01010"],
+"X":["10001","10001","01010","00100","01010","10001","10001"],
+"Y":["10001","10001","01010","00100","00100","00100","00100"],
+"Z":["11111","00001","00010","00100","01000","10000","11111"],
+"0":["01110","10001","10011","10101","11001","10001","01110"],
+"1":["00100","01100","00100","00100","00100","00100","01110"],
+"2":["01110","10001","00001","00010","00100","01000","11111"],
+"3":["11110","00001","00001","01110","00001","00001","11110"],
+"4":["00010","00110","01010","10010","11111","00010","00010"],
+"5":["11111","10000","10000","11110","00001","00001","11110"],
+"6":["01110","10000","10000","11110","10001","10001","01110"],
+"7":["11111","00001","00010","00100","01000","01000","01000"],
+"8":["01110","10001","10001","01110","10001","10001","01110"],
+"9":["01110","10001","10001","01111","00001","00001","01110"],
+"/":["00001","00010","00100","01000","10000","00000","00000"],
+"-":["00000","00000","00000","11111","00000","00000","00000"],
+".":["00000","00000","00000","00000","00000","00110","00110"],
+":":["00000","00110","00110","00000","00110","00110","00000"],
+"|":["00100","00100","00100","00100","00100","00100","00100"],
+" ":["00000"]*7
+}
+
+
+def _order_block_zones(bars, input_range=25):
+    """
+    Port of the supplied Pine Order Blocks core:
+    prior-range BOS, last opposite candle's tracked high/low as block bounds,
+    and removal when candle close breaks the far edge.
+    Returns active bullish/bearish zones with their creation timestamps.
+    """
+    zones = []
+    last_down_index = None
+    last_down_high = 0.0
+    last_low = 0.0
+    last_up_index = None
+    last_up_low = 0.0
+    last_high = 0.0
+    last_long_index = -1
+
+    for i, candle in enumerate(bars):
+        op = float(candle["open"]); cl = float(candle["close"])
+        hi = float(candle["high"]); lo = float(candle["low"])
+        if i >= input_range + 1:
+            prior = bars[i-input_range:i]
+            structure_low = min(float(x["low"]) for x in prior)
+            structure_high = max(float(x["high"]) for x in prior)
+            prev_c = float(bars[i-1]["close"])
+            prev_prior = bars[i-input_range-1:i-1]
+            prev_structure_low = min(float(x["low"]) for x in prev_prior) if len(prev_prior) == input_range else structure_low
+            prev_structure_high = max(float(x["high"]) for x in prev_prior) if len(prev_prior) == input_range else structure_high
+
+            bearish_bos = cl < structure_low and prev_c >= prev_structure_low
+            bullish_bos = cl > structure_high and prev_c <= prev_structure_high
+
+            if bearish_bos and last_up_index is not None and i-last_up_index < 1000:
+                top = max(last_high, last_up_low)
+                bottom = min(last_high, last_up_low)
+                if top > bottom > 0:
+                    zones.append({"kind":"BEARISH", "top":top, "bottom":bottom,
+                                  "start":int(bars[last_up_index]["time"]), "active":True})
+            if bullish_bos and last_down_index is not None and i-last_down_index < 1000 and i > last_long_index:
+                top = max(last_down_high, last_low)
+                bottom = min(last_down_high, last_low)
+                if top > bottom > 0:
+                    zones.append({"kind":"BULLISH", "top":top, "bottom":bottom,
+                                  "start":int(bars[last_down_index]["time"]), "active":True})
+                    last_long_index = i
+
+            # Apply the Pine block invalidation rules to all existing zones.
+            for z in zones:
+                if not z["active"]:
+                    continue
+                if z["kind"] == "BULLISH" and cl < z["bottom"]:
+                    z["active"] = False
+                elif z["kind"] == "BEARISH" and cl > z["top"]:
+                    z["active"] = False
+
+        # Pine's candle tracking: reset on each opposite candle, then keep
+        # running extreme until the next candle of that same direction.
+        if cl < op:
+            last_down_high = hi
+            last_down_index = i
+            last_low = lo
+        elif cl > op:
+            last_up_index = i
+            last_up_low = lo
+            last_high = hi
+
+        if last_down_index is not None:
+            last_low = min(lo, last_low)
+        if last_up_index is not None:
+            last_high = max(hi, last_high)
+
+    return [z for z in zones if z["active"]]
+
+
+
+def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620, zones=None):
+    """Render candles, Pine-derived OB zones and a visible symbol/timeframe header."""
     data = bars[-max_candles:]
     if len(data) < 2:
         raise ValueError("Not enough candles to render chart")
 
-    # RGB canvas. Dark TradingView-like chart, no external imaging dependency.
     bg = (15, 23, 42)
     grid = (43, 55, 75)
     up = (22, 190, 130)
     down = (239, 76, 86)
-    text_color = (220, 228, 240)
+    text_color = (235, 241, 250)
     pixels = bytearray(bg * (width * height))
 
     def pixel(x, y, color):
@@ -1633,16 +1754,48 @@ def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620):
             for xx in range(max(0, x1), min(width, x2+1)):
                 pixel(xx, yy, color)
 
-    left, right, top, bottom = 65, width-28, 78, height-48
+    def blend_rect(x1, y1, x2, y2, color, alpha=52):
+        for yy in range(max(0, y1), min(height, y2+1)):
+            for xx in range(max(0, x1), min(width, x2+1)):
+                idx = (yy * width + xx) * 3
+                for c in range(3):
+                    pixels[idx+c] = (pixels[idx+c]*(255-alpha) + color[c]*alpha)//255
+
+    def draw_text(x, y, text, color=text_color, scale=2):
+        cursor = x
+        for ch in str(text).upper():
+            glyph = _FONT_5X7.get(ch, _FONT_5X7[" "])
+            for gy, row in enumerate(glyph):
+                for gx, bit in enumerate(row):
+                    if bit == "1":
+                        rect(cursor+gx*scale, y+gy*scale,
+                             cursor+(gx+1)*scale-1, y+(gy+1)*scale-1, color)
+            cursor += 6*scale
+        return cursor
+
+    left, right, top, bottom = 65, width-28, 92, height-48
     highs = [float(x["high"]) for x in data]
     lows = [float(x["low"]) for x in data]
+    visible_times = [int(x["time"]) for x in data]
     lo, hi = min(lows), max(highs)
+    relevant_zones = [
+        z for z in (zones or [])
+        if z["top"] >= lo*0.75 and z["bottom"] <= hi*1.25
+    ]
+    if relevant_zones:
+        lo = min(lo, min(z["bottom"] for z in relevant_zones))
+        hi = max(hi, max(z["top"] for z in relevant_zones))
     pad = (hi-lo)*0.06 if hi > lo else max(abs(hi)*0.02, 0.01)
     lo -= pad; hi += pad
     span = hi-lo or 1.0
 
     def yprice(value):
         return int(bottom - (value-lo)/span*(bottom-top))
+
+    # Header background and title.
+    rect(0, 0, width-1, 69, (20, 31, 51))
+    draw_text(28, 22, title, text_color, 3)
+    line(0, 70, width-1, 70, (67, 86, 115), 1)
 
     for i in range(6):
         y = top + (bottom-top)*i//5
@@ -1652,6 +1805,26 @@ def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620):
         line(x, top, x, bottom, grid)
 
     step = (right-left)/len(data)
+
+    # Draw active OB zones before candles, extending to the right edge.
+    for z in relevant_zones:
+        start_ts = int(z["start"])
+        try:
+            start_idx = next(i for i, ts in enumerate(visible_times) if ts >= start_ts)
+            x1 = int(left + start_idx*step)
+        except StopIteration:
+            x1 = left
+        y1, y2 = sorted((yprice(z["top"]), yprice(z["bottom"])))
+        if z["kind"] == "BULLISH":
+            zone_color = (80, 190, 130)
+            border_color = (65, 210, 145)
+        else:
+            zone_color = (210, 160, 65)
+            border_color = (235, 180, 75)
+        blend_rect(x1, y1, right, y2, zone_color, 48)
+        line(x1, y1, right, y1, border_color, 2)
+        line(x1, y2, right, y2, border_color, 2)
+
     candle_w = max(3, min(10, int(step*0.58)))
     for i, candle in enumerate(data):
         x = int(left + (i+0.5)*step)
@@ -1664,13 +1837,10 @@ def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620):
             y2 = y1+2
         rect(x-candle_w//2, y1, x+candle_w//2, y2, color)
 
-    # Current price marker.
     last_price = float(data[-1]["close"])
     ylast = yprice(last_price)
     line(left, ylast, right, ylast, (235, 190, 70), 1)
 
-    # Tiny bitmap-free title band and price metadata are intentionally omitted;
-    # the Telegram caption carries symbol, timeframe and measured impulse.
     raw = bytearray()
     stride = width*3
     for y in range(height):
@@ -1701,14 +1871,26 @@ def send_impulse_telegram(sym, impulse_by_tf):
         chart_specs.append(("4H", impulse_by_tf["4H"], FOUR_HOUR_CHART_CANDLES))
     for tf, detail, _count in chart_specs:
         sign = "+" if detail["direction"] == "PUMP" else "-"
-        captions.append(f"{tf}: <b>{detail['direction']}</b> {sign}{detail['pct']:.1f}%")
+        period_label = "5 ДНЕЙ" if tf == "1D" else "8 ЧАСОВ"
+        captions.append(
+            f"{tf} ({period_label}): <b>{detail['direction']}</b> "
+            f"{sign}{detail['pct']:.1f}%"
+        )
 
     try:
         for index, (tf, detail, count) in enumerate(chart_specs):
             interval = "1d" if tf == "1D" else "4h"
-            rows = get_bars(ACTIVE_EXCHANGE, sym, interval, count)
-            bars = _bars_to_dict(rows)
-            image_bytes = render_candlestick_png(bars, f"{sym} {tf}", count)
+            # Load extended history so the Order Blocks engine can detect
+            # BOS events and keep zones that originated before the visible chart.
+            history_rows = get_bars(ACTIVE_EXCHANGE, sym, interval, max(500, count))
+            history_bars = _bars_to_dict(history_rows)
+            zones = _order_block_zones(history_bars, input_range=25)
+            display_bars = history_bars[-count:]
+            chart_symbol = sym[:-4] + "/USDT" if sym.endswith("USDT") else sym
+            chart_title = f"{chart_symbol} | {tf} | ORDER BLOCKS"
+            image_bytes = render_candlestick_png(
+                history_bars, chart_title, count, zones=zones
+            )
             filename = f"chart_{index}.png"
             files[filename] = (filename, image_bytes, "image/png")
             media_item = {
