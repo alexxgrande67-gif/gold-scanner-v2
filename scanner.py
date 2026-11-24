@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""GOLD SCANNER scheduled backend. Optimized OKX/Gate.io scanner."""
+"""FALSE BREAKOUT SCANNER scheduled backend. Dynamic OKX/Gate.io scanner."""
 
 from __future__ import annotations
 
@@ -36,6 +36,16 @@ _daily_cache = {
 }
 _daily_cache_lock = threading.Lock()
 
+# Independent 4H candles cache. This file belongs only to this scanner project.
+FOUR_HOUR_CACHE_FILE = Path("four_hour_cache.json")
+FOUR_HOUR_CACHE_VERSION = 1
+_four_hour_cache = {
+    "version": FOUR_HOUR_CACHE_VERSION,
+    "exchange": None,
+    "symbols": {}
+}
+_four_hour_cache_lock = threading.Lock()
+
 # False-breakout parameters
 FB = {
     "swing": 1,
@@ -45,6 +55,8 @@ FB = {
 }
 
 TOP_UNIVERSE = 500
+# Liquidity preselection pool. Activity ranking is then calculated inside it.
+UNIVERSE_CANDIDATES = 1000
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
 
 SCAN_WORKERS = max(
@@ -285,18 +297,22 @@ def _okx_universe():
             continue
 
         try:
-            turnover = (
-                float(ticker.get("volCcy24h") or 0)
-                * float(ticker.get("last") or 0)
+            last = float(ticker.get("last") or 0)
+            turnover = float(ticker.get("volCcy24h") or 0) * last
+            open_24h = float(ticker.get("open24h") or 0)
+            change_24h = (
+                (last / open_24h - 1.0) * 100.0
+                if last > 0 and open_24h > 0
+                else 0.0
             )
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, ZeroDivisionError):
             continue
 
-        if turnover > 0:
-            items.append((sym, turnover))
+        if turnover > 0 and last > 0:
+            items.append((sym, turnover, change_24h))
 
     items.sort(key=lambda x: x[1], reverse=True)
-    return items[:TOP_UNIVERSE]
+    return items[:UNIVERSE_CANDIDATES]
 
 
 def _gate_universe():
@@ -329,24 +345,65 @@ def _gate_universe():
             continue
 
         try:
-            turnover = float(
-                ticker.get("volume_24h_quote") or 0
-            )
+            turnover = float(ticker.get("volume_24h_quote") or 0)
+            change_24h = float(ticker.get("change_percentage") or 0)
         except (TypeError, ValueError):
             continue
 
         if turnover > 0:
-            items.append((sym, turnover))
+            items.append((sym, turnover, change_24h))
 
     items.sort(key=lambda x: x[1], reverse=True)
-    return items[:TOP_UNIVERSE]
+    return items[:UNIVERSE_CANDIDATES]
+
+
+def _recent_range_pct(exchange, symbol):
+    """Range of the latest six 1H candles, expressed as a percentage."""
+    rows = get_bars(exchange, symbol, "1h", 6)
+
+    if len(rows) < 3:
+        return None
+
+    highs = [row[2] for row in rows]
+    lows = [row[3] for row in rows]
+    last_close = rows[-1][4]
+
+    if last_close <= 0:
+        return None
+
+    return (max(highs) - min(lows)) / last_close * 100.0
+
+
+def _percentile_ranks(values):
+    """Return 0..1 percentile ranks, preserving equal-value ties."""
+    if not values:
+        return []
+
+    ordered = sorted(range(len(values)), key=lambda i: values[i])
+    ranks = [0.0] * len(values)
+    if len(values) == 1:
+        return [1.0]
+
+    pos = 0
+    while pos < len(ordered):
+        end = pos + 1
+        value = values[ordered[pos]]
+        while end < len(ordered) and values[ordered[end]] == value:
+            end += 1
+        rank = ((pos + end - 1) / 2) / (len(values) - 1)
+        for j in range(pos, end):
+            ranks[ordered[j]] = rank
+        pos = end
+
+    return ranks
 
 
 def build_stable_universe():
+    """Build a fresh universe ranked by 24H movement and recent 6H volatility."""
     global ACTIVE_EXCHANGE
 
     try:
-        items = _okx_universe()
+        candidates = _okx_universe()
         ACTIVE_EXCHANGE = "okx"
 
     except Exception as exc:
@@ -356,24 +413,80 @@ def build_stable_universe():
             flush=True
         )
 
-        items = _gate_universe()
+        candidates = _gate_universe()
         ACTIVE_EXCHANGE = "gate"
 
-    selected = items[:MAX_MONITORED]
+    if not candidates:
+        return []
+
+    exchange = ACTIVE_EXCHANGE
+    measured = []
+    failed_volatility = 0
 
     print(
-        f"[INFO] ATR filter disabled. "
-        f"BTC stability filter disabled. "
-        f"Top universe={len(items)}; "
-        f"monitoring={len(selected)}; "
-        f"workers={SCAN_WORKERS}; "
+        f"[UNIVERSE] Liquidity preselection: {len(candidates)} contracts; "
+        f"measuring latest 6 hourly candles...",
+        flush=True
+    )
+
+    with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, 10)) as executor:
+        futures = {
+            executor.submit(_recent_range_pct, exchange, item[0]): item
+            for item in candidates
+        }
+
+        for future in as_completed(futures):
+            sym, turnover, change_24h = futures[future]
+            try:
+                recent_range = future.result()
+                if recent_range is None:
+                    failed_volatility += 1
+                    continue
+                measured.append((sym, turnover, change_24h, recent_range))
+            except Exception:
+                failed_volatility += 1
+
+    # If recent candles are temporarily unavailable for some contracts,
+    # retain them with zero recent range rather than silently shrinking the pool.
+    if len(measured) < min(TOP_UNIVERSE, len(candidates)):
+        measured_symbols = {item[0] for item in measured}
+        for sym, turnover, change_24h in candidates:
+            if sym not in measured_symbols:
+                measured.append((sym, turnover, change_24h, 0.0))
+
+    abs_24h = [abs(item[2]) for item in measured]
+    recent_ranges = [item[3] for item in measured]
+    rank_24h = _percentile_ranks(abs_24h)
+    rank_recent = _percentile_ranks(recent_ranges)
+
+    ranked = []
+    for item, r24, rrecent in zip(measured, rank_24h, rank_recent):
+        sym, turnover, change_24h, recent_range = item
+        activity_score = 0.5 * r24 + 0.5 * rrecent
+        ranked.append((sym, turnover, change_24h, recent_range, activity_score))
+
+    ranked.sort(key=lambda x: (x[4], x[1]), reverse=True)
+    limit = min(TOP_UNIVERSE, MAX_MONITORED)
+    selected = ranked[:limit]
+
+    print(
+        f"[UNIVERSE] Ranked={len(ranked)}; selected={len(selected)}; "
+        f"volatility data fallbacks={failed_volatility}; "
+        f"score=50% |24H change| rank + 50% 6H range rank; "
         f"exchange={ACTIVE_EXCHANGE}",
         flush=True
     )
 
+    if selected:
+        preview = ", ".join(
+            f"{x[0]}(24h={x[2]:+.1f}%,6hRange={x[3]:.1f}%)"
+            for x in selected[:8]
+        )
+        print(f"[UNIVERSE] Most active: {preview}", flush=True)
+
     return [
-        (sym, quote_volume, None)
-        for sym, quote_volume in selected
+        (sym, turnover, None)
+        for sym, turnover, _, _, _ in selected
     ]
 
 
@@ -489,7 +602,12 @@ def get_bars(exchange, symbol, interval, limit):
             "-USDT-SWAP"
         )
 
-        bar = "5m" if interval == "5m" else "1D"
+        bar = {
+            "5m": "5m",
+            "1h": "1H",
+            "4h": "4H",
+            "1d": "1D"
+        }.get(interval, "1D")
 
         rows = _okx_rows(
             inst_id,
@@ -500,7 +618,12 @@ def get_bars(exchange, symbol, interval, limit):
         return _normalise_rows(rows, "okx")
 
     contract = _base(symbol) + "_USDT"
-    gate_interval = "5m" if interval == "5m" else "1d"
+    gate_interval = {
+        "5m": "5m",
+        "1h": "1h",
+        "4h": "4h",
+        "1d": "1d"
+    }.get(interval, "1d")
 
     rows = _gate_rows(
         contract,
@@ -682,6 +805,145 @@ def save_daily_cache():
         f"{len(data['symbols'])} symbols.",
         flush=True
     )
+
+
+# ============================================================
+# 4H CANDLES CACHE
+# ============================================================
+def load_four_hour_cache(exchange):
+    global _four_hour_cache
+
+    if not FOUR_HOUR_CACHE_FILE.exists():
+        print(
+            "[CACHE] four_hour_cache.json not found; "
+            "full 4H history will be downloaded.",
+            flush=True
+        )
+        _four_hour_cache = {
+            "version": FOUR_HOUR_CACHE_VERSION,
+            "exchange": exchange,
+            "symbols": {}
+        }
+        return
+
+    try:
+        data = json.loads(
+            FOUR_HOUR_CACHE_FILE.read_text(encoding="utf-8")
+        )
+
+        if (
+            data.get("version") != FOUR_HOUR_CACHE_VERSION
+            or data.get("exchange") != exchange
+            or not isinstance(data.get("symbols"), dict)
+        ):
+            print(
+                "[CACHE] 4H cache version or exchange mismatch; "
+                "starting with an empty cache.",
+                flush=True
+            )
+            _four_hour_cache = {
+                "version": FOUR_HOUR_CACHE_VERSION,
+                "exchange": exchange,
+                "symbols": {}
+            }
+            return
+
+        valid_symbols = {}
+        for symbol, rows in data["symbols"].items():
+            if not isinstance(rows, list):
+                continue
+            valid_rows = []
+            for row in rows:
+                try:
+                    if len(row) < 6:
+                        continue
+                    valid_rows.append([
+                        int(row[0]), float(row[1]), float(row[2]),
+                        float(row[3]), float(row[4]), float(row[5])
+                    ])
+                except (TypeError, ValueError):
+                    continue
+            valid_rows.sort(key=lambda x: x[0])
+            if valid_rows:
+                valid_symbols[symbol] = valid_rows[-700:]
+
+        _four_hour_cache = {
+            "version": FOUR_HOUR_CACHE_VERSION,
+            "exchange": exchange,
+            "symbols": valid_symbols
+        }
+        print(
+            f"[CACHE] Loaded 4H history for {len(valid_symbols)} symbols.",
+            flush=True
+        )
+
+    except Exception as exc:
+        print(
+            f"[CACHE] Cannot read 4H cache: {type(exc).__name__}: {exc}",
+            flush=True
+        )
+        _four_hour_cache = {
+            "version": FOUR_HOUR_CACHE_VERSION,
+            "exchange": exchange,
+            "symbols": {}
+        }
+
+
+def get_cached_four_hour_bars(exchange, symbol):
+    with _four_hour_cache_lock:
+        cached = [row[:] for row in _four_hour_cache["symbols"].get(symbol, [])]
+
+    download_limit = 30 if cached else 700
+    try:
+        fresh = get_bars(exchange, symbol, "4h", download_limit)
+        merged = {int(row[0]): row for row in cached}
+        for row in fresh:
+            merged[int(row[0])] = row
+        result = [merged[ts] for ts in sorted(merged)][-700:]
+        with _four_hour_cache_lock:
+            _four_hour_cache["symbols"][symbol] = result
+        return result
+    except Exception as exc:
+        if len(cached) >= 60:
+            print(
+                f"[CACHE] {symbol}: 4H refresh failed; using cached history. "
+                f"{type(exc).__name__}: {exc}",
+                flush=True
+            )
+            return cached
+        raise
+
+
+def save_four_hour_cache():
+    with _four_hour_cache_lock:
+        data = {
+            "version": FOUR_HOUR_CACHE_VERSION,
+            "exchange": _four_hour_cache["exchange"],
+            "symbols": _four_hour_cache["symbols"]
+        }
+        serialized = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+
+    temp_file = FOUR_HOUR_CACHE_FILE.with_suffix(".tmp")
+    temp_file.write_text(serialized, encoding="utf-8")
+    temp_file.replace(FOUR_HOUR_CACHE_FILE)
+    print(
+        f"[CACHE] Saved 4H history for {len(data['symbols'])} symbols.",
+        flush=True
+    )
+
+
+def _bars_to_dict(rows):
+    return [
+        {
+            "time": int(k[0]),
+            "open": k[1],
+            "high": k[2],
+            "low": k[3],
+            "close": k[4],
+            "volume": k[5]
+        }
+        for k in rows
+    ]
 
 
 # ============================================================
@@ -992,6 +1254,194 @@ def fb_compute(days, m5, now_ms=None):
     }
 
 
+
+def fb_compute_4h(bars4h, m5, now_ms=None):
+    n = len(bars4h)
+    L = FB["swing"]
+
+    if n < L * 2 + 20:
+        return {
+            "levels": [],
+            "events": []
+        }
+
+    ev, atr = fb_events(bars4h)
+
+    H = []
+    Lo = []
+
+    def add(arr, side, it, a):
+        if any(
+            abs(x["price"] - it["price"])
+            <= a * FB["mergeAtr"]
+            for x in arr
+        ):
+            return
+
+        arr.append({
+            "side": side,
+            "price": it["price"],
+            "time": it["time"],
+            "st": 0,
+            "touch": 0
+        })
+
+        if len(arr) > 240:
+            arr.pop(0)
+
+    def add_day(i):
+        e = ev[i]
+
+        if e:
+            for x in e["h"]:
+                add(H, "H", x, e["atr"] or 0)
+
+            for x in e["l"]:
+                add(Lo, "L", x, e["atr"] or 0)
+
+    if m5:
+        ds = (
+            (m5[0]["time"] + 14399) // 14400
+        ) * 14400
+
+        k = next(
+            (
+                i for i, d in enumerate(bars4h)
+                if d["time"] >= ds
+            ),
+            -1
+        )
+
+        i_start = k if k >= 0 else n
+    else:
+        i_start = n
+
+    if i_start > n - 1:
+        i_start = n - 1
+
+    for i in range(i_start):
+        add_day(i)
+
+        H = [
+            x for x in H
+            if bars4h[i]["high"] < x["price"]
+        ]
+
+        Lo = [
+            x for x in Lo
+            if bars4h[i]["low"] > x["price"]
+        ]
+
+    events = []
+    cur = i_start
+
+    add_day(cur)
+
+    now_sec = (
+        (now_ms or int(time.time() * 1000)) / 1000
+    )
+
+    for bi, b in enumerate(m5):
+        if b["time"] < bars4h[i_start]["time"]:
+            continue
+
+        while (
+            cur + 1 < n
+            and b["time"] >= bars4h[cur + 1]["time"]
+        ):
+            cur += 1
+            add_day(cur)
+
+        closed = (
+            bi < len(m5) - 1
+            or b["time"] + 300 <= now_sec
+        )
+
+        D = FB["leaveAtr"] * (
+            atr[cur - 1] or atr[cur] or 0
+        )
+
+        gone = False
+
+        for x in H:
+            if closed and b["close"] > x["price"]:
+                x["st"] = 2
+                gone = True
+                continue
+
+            if closed and b["high"] >= x["price"]:
+                x["st"] = 1
+                x["touch"] = b["time"]
+
+                events.append({
+                    "side": "H",
+                    "price": x["price"],
+                    "time": x["time"],
+                    "touch": b["time"],
+                    "timeframe": "4H"
+                })
+
+                continue
+
+            if (
+                x["st"] == 1
+                and x["touch"] < b["time"]
+                and (
+                    b["high"] >= x["price"] + D
+                    or b["low"] <= x["price"] - D
+                )
+            ):
+                x["st"] = 2
+                gone = True
+
+        for x in Lo:
+            if closed and b["close"] < x["price"]:
+                x["st"] = 2
+                gone = True
+                continue
+
+            if closed and b["low"] <= x["price"]:
+                x["st"] = 1
+                x["touch"] = b["time"]
+
+                events.append({
+                    "side": "L",
+                    "price": x["price"],
+                    "time": x["time"],
+                    "touch": b["time"],
+                    "timeframe": "4H"
+                })
+
+                continue
+
+            if (
+                x["st"] == 1
+                and x["touch"] < b["time"]
+                and (
+                    b["low"] <= x["price"] - D
+                    or b["high"] >= x["price"] + D
+                )
+            ):
+                x["st"] = 2
+                gone = True
+
+        if gone:
+            H = [
+                x for x in H
+                if x["st"] != 2
+            ]
+
+            Lo = [
+                x for x in Lo
+                if x["st"] != 2
+            ]
+
+    return {
+        "levels": H + Lo,
+        "events": events
+    }
+
+
 # ============================================================
 # STATE
 # ============================================================
@@ -1081,10 +1531,11 @@ def send_telegram(sym, event, atr_pct):
     )
 
     message = (
-        "🟡 <b>GOLD SCANNER</b>\n"
+        "🟡 <b>FALSE BREAKOUT SCANNER</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"Монета: <b>{html.escape(sym)}</b>\n"
         f"Сигнал: <b>{side}</b>\n"
+        f"Таймфрейм уровня: <b>{html.escape(event.get('timeframe', '1D'))}</b>\n"
         f"Уровень: <code>{event['price']:.12g}</code>\n"
         f"Время свечи: {dt}\n"
         f"ATR: {atr_pct:.2f}%\n"
@@ -1114,7 +1565,7 @@ def send_telegram_test():
         return False
 
     message = (
-        "🟡 <b>GOLD SCANNER — ТЕСТ УВЕДОМЛЕНИЯ</b>\n\n"
+        "🟡 <b>FALSE BREAKOUT SCANNER — ТЕСТ УВЕДОМЛЕНИЯ</b>\n\n"
         "Telegram успешно подключён!\n"
         "Бот может отправлять уведомления.\n\n"
         "Это проверочное сообщение, не торговый сигнал."
@@ -1143,122 +1594,80 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
     """
     Process one symbol independently.
 
-    Returns:
-        symbol, discovered events, seed keys, success, error
+    Daily levels are invalidated by daily candles.
+    4H levels are invalidated by 4H candles.
+    Both level sets are checked against the same last 288 five-minute candles.
     """
-
     try:
-        days_raw = get_cached_daily_bars(
-            exchange,
-            sym
-        )
+        days_raw = get_cached_daily_bars(exchange, sym)
+        four_hour_raw = get_cached_four_hour_bars(exchange, sym)
+        m5_raw = get_bars(exchange, sym, "5m", 288)
 
-        m5_raw = get_bars(
-            exchange,
-            sym,
-            "5m",
-            288
-        )
+        days = _bars_to_dict(days_raw)
+        bars4h = _bars_to_dict(four_hour_raw)
+        m5 = _bars_to_dict(m5_raw)
 
-        days = [
-            {
-                "time": int(k[0]),
-                "open": k[1],
-                "high": k[2],
-                "low": k[3],
-                "close": k[4],
-                "volume": k[5]
-            }
-            for k in days_raw
-        ]
-
-        m5 = [
-            {
-                "time": int(k[0]),
-                "open": k[1],
-                "high": k[2],
-                "low": k[3],
-                "close": k[4],
-                "volume": k[5]
-            }
-            for k in m5_raw
-        ]
-
-        if len(days) < 60 or len(m5) < 30:
+        if len(days) < 60 or len(bars4h) < 60 or len(m5) < 30:
             return (
-                sym,
-                [],
-                [],
-                False,
+                sym, [], [], False,
                 f"insufficient candle history "
-                f"(daily={len(days)}, 5m={len(m5)})"
+                f"(daily={len(days)}, 4h={len(bars4h)}, 5m={len(m5)})"
             )
 
-        highs = [
-            d["high"]
-            for d in days[:-1]
-        ]
-
-        lows = [
-            d["low"]
-            for d in days[:-1]
-        ]
-
-        closes = [
-            d["close"]
-            for d in days[:-1]
-        ]
-
-        atr_value = wilder_atr(
-            highs,
-            lows,
-            closes,
-            14
-        )
-
+        # Keep the original daily ATR calculation for daily-level alerts.
+        highs = [d["high"] for d in days[:-1]]
+        lows = [d["low"] for d in days[:-1]]
+        closes = [d["close"] for d in days[:-1]]
+        atr_value = wilder_atr(highs, lows, closes, 14)
         last_close = days[-1]["close"]
-
-        atr_pct = (
+        daily_atr_pct = (
             atr_value / last_close * 100
             if atr_value and last_close > 0
             else 0.0
         )
 
-        result = fb_compute(days, m5)
+        # 4H ATR is displayed for 4H-level alerts, so the metric matches the level TF.
+        highs4 = [d["high"] for d in bars4h[:-1]]
+        lows4 = [d["low"] for d in bars4h[:-1]]
+        closes4 = [d["close"] for d in bars4h[:-1]]
+        atr4_value = wilder_atr(highs4, lows4, closes4, 14)
+        last_close4 = bars4h[-1]["close"]
+        atr4_pct = (
+            atr4_value / last_close4 * 100
+            if atr4_value and last_close4 > 0
+            else 0.0
+        )
+
+        daily_result = fb_compute(days, m5)
+        four_hour_result = fb_compute_4h(bars4h, m5)
 
         discovered = []
         seed_keys = []
 
-        for event in result["events"]:
+        combined = (
+            [(event, daily_atr_pct) for event in daily_result["events"]]
+            + [(event, atr4_pct) for event in four_hour_result["events"]]
+        )
+
+        for event, atr_pct in combined:
+            # Mark the original daily engine's events without changing its logic.
+            if "timeframe" not in event:
+                event["timeframe"] = "1D"
+
             key = (
-                f"{sym}|{event['side']}|{event['time']}|"
-                f"{event['price']:.12g}|{event['touch']}"
+                f"{sym}|{event['timeframe']}|{event['side']}|"
+                f"{event['time']}|{event['price']:.12g}|{event['touch']}"
             )
 
             if is_new_symbol:
                 seed_keys.append(key)
-
             elif key not in seen_snapshot:
-                discovered.append(
-                    (sym, event, atr_pct, key)
-                )
+                discovered.append((sym, event, atr_pct, key))
 
-        return (
-            sym,
-            discovered,
-            seed_keys,
-            True,
-            None
-        )
+        return sym, discovered, seed_keys, True, None
 
     except Exception as exc:
-        return (
-            sym,
-            [],
-            [],
-            False,
-            f"{type(exc).__name__}: {exc}"
-        )
+        return sym, [], [], False, f"{type(exc).__name__}: {exc}"
 
 
 # ============================================================
@@ -1271,7 +1680,7 @@ def main():
     started_at = time.time()
 
     print(
-        "GOLD SCANNER: start",
+        "FALSE BREAKOUT SCANNER: start",
         flush=True
     )
 
@@ -1300,8 +1709,9 @@ def main():
     symbols = build_stable_universe()
     exchange = ACTIVE_EXCHANGE
 
-    # Load daily candle cache for the selected exchange.
+    # Load independent daily and 4H candle caches for this scanner project.
     load_daily_cache(exchange)
+    load_four_hour_cache(exchange)
 
     print(
         f"Universe selected: {len(symbols)} symbols; "
@@ -1415,8 +1825,9 @@ def main():
                     flush=True
                 )
 
-    # Save updated daily cache after all workers have finished.
+    # Save updated daily and 4H caches after all workers have finished.
     save_daily_cache()
+    save_four_hour_cache()
 
     if not state.get("primed"):
         state["primed"] = True
@@ -1482,7 +1893,7 @@ def main():
     elapsed = time.time() - started_at
 
     print(
-        f"GOLD SCANNER: finished; "
+        f"FALSE BREAKOUT SCANNER: finished; "
         f"scanned={successful_symbols}; "
         f"symbol errors={failed_symbols}; "
         f"new candidates={len(discovered)}; "
