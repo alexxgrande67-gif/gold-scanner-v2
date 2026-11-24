@@ -59,14 +59,13 @@ FB = {
 TOP_UNIVERSE = 500
 # Liquidity preselection pool. Activity ranking is then calculated inside it.
 UNIVERSE_CANDIDATES = 1000
-# Strict impulse filters for the dynamic universe.
+# Intrabar impulse filters: evaluate the currently forming candle, not old candles.
 DAILY_IMPULSE_MIN_PCT = 50.0
 FOUR_HOUR_IMPULSE_MIN_PCT = 25.0
-# Measure a recent impulse from the first candle's open to the furthest
-# high/low reached inside each rolling window.
-DAILY_IMPULSE_LOOKBACK = 5       # last 5 daily candles (5 days)
-FOUR_HOUR_IMPULSE_LOOKBACK = 2   # last 2 four-hour candles (8 hours)
 IMPULSE_REPEAT_STEP_PCT = 20.0   # resend after an additional 20 percentage points
+IMPULSE_VOLUME_LOOKBACK = 20     # compare current volume pace with 20 completed candles
+IMPULSE_MIN_RELATIVE_VOLUME = 1.20
+IMPULSE_MIN_BODY_RATIO = 0.55    # candle body / full high-low range
 DAILY_CHART_CANDLES = 90
 FOUR_HOUR_CHART_CANDLES = 72
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
@@ -214,6 +213,18 @@ def _okx_rows(inst_id: str, bar: str, limit: int):
         rows_by_ts[k]
         for k in sorted(rows_by_ts)
     ][-limit:]
+
+
+def _okx_live_rows(inst_id: str, bar: str, limit: int):
+    """Fetch recent candles including the currently forming candle."""
+    data = get_json(
+        OKX + "/api/v5/market/candles",
+        {"instId": inst_id, "bar": bar, "limit": str(min(limit, 300))}
+    )
+    if data.get("code") != "0":
+        raise RuntimeError(f"OKX live candles {inst_id}: {data.get('msg')}")
+    rows = data.get("data", [])
+    return sorted(rows, key=lambda row: int(row[0]))
 
 
 def _gate_rows(contract: str, interval: str, limit: int):
@@ -369,83 +380,73 @@ def _gate_universe():
     return items[:UNIVERSE_CANDIDATES]
 
 
-def _impulse_pct(exchange, symbol, interval, lookback):
-    """Largest directional excursion from the first candle's open."""
-    rows = get_bars(exchange, symbol, interval, lookback)
-    if len(rows) < lookback:
+def _impulse_details_current(bars, interval, min_pct=None, now_ts=None):
+    """Evaluate only the active candle: signed open-to-current-close move + volume pace."""
+    if len(bars) < IMPULSE_VOLUME_LOOKBACK + 1:
+        return None
+    now_ts = int(now_ts or time.time())
+    current = bars[-1]
+    previous = bars[-(IMPULSE_VOLUME_LOOKBACK + 1):-1]
+    op = float(current[1]); high = float(current[2]); low = float(current[3]); close = float(current[4])
+    current_volume = max(0.0, float(current[5]))
+    if op <= 0 or close <= 0 or high < low:
         return None
 
-    window = rows[-lookback:]
-    start_price = float(window[0][1])
-    if start_price <= 0:
+    signed_pct = (close / op - 1.0) * 100.0
+    direction = "PUMP" if signed_pct >= 0 else "DUMP"
+    move_pct = abs(signed_pct)
+    candle_range = max(0.0, high - low)
+    body = abs(close - op)
+    body_ratio = body / candle_range if candle_range > 0 else 0.0
+
+    duration = 86400 if interval == "1d" else 14400
+    elapsed = max(0.05, min(1.0, (now_ts - int(current[0])) / duration))
+    previous_volumes = [max(0.0, float(row[5])) for row in previous]
+    avg_volume = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0.0
+    expected_volume = avg_volume * elapsed
+    relative_volume = current_volume / expected_volume if expected_volume > 0 else 0.0
+
+    # All filters apply to the current forming candle; no completed-candle delay.
+    threshold = min_pct
+    if threshold is None:
+        threshold = DAILY_IMPULSE_MIN_PCT if interval == "1d" else FOUR_HOUR_IMPULSE_MIN_PCT
+    if move_pct < threshold:
         return None
-
-    highest = max(float(row[2]) for row in window)
-    lowest = min(float(row[3]) for row in window)
-    up_pct = (highest / start_price - 1.0) * 100.0
-    down_pct = (1.0 - lowest / start_price) * 100.0
-    return max(0.0, up_pct, down_pct)
-
-
-def _impulse_details(bars, lookback):
-    """Return the strongest signed excursion from the first candle open."""
-    if len(bars) < lookback:
+    if body_ratio < IMPULSE_MIN_BODY_RATIO:
         return None
-
-    window = bars[-lookback:]
-    first = window[0]
-    start_price = float(first["open"] if isinstance(first, dict) else first[1])
-    if start_price <= 0:
+    if relative_volume < IMPULSE_MIN_RELATIVE_VOLUME:
         return None
-
-    highest = max(float(x["high"] if isinstance(x, dict) else x[2]) for x in window)
-    lowest = min(float(x["low"] if isinstance(x, dict) else x[3]) for x in window)
-    up_pct = (highest / start_price - 1.0) * 100.0
-    down_pct = (1.0 - lowest / start_price) * 100.0
-
-    if up_pct >= down_pct:
-        direction = "PUMP"
-        value = up_pct
-    else:
-        direction = "DUMP"
-        value = down_pct
 
     return {
-        "pct": round(max(0.0, value), 2),
+        "pct": round(move_pct, 2),
+        "signed_pct": round(signed_pct, 2),
         "direction": direction,
-        "start_time": int(first["time"] if isinstance(first, dict) else first[0]),
-        "start_price": start_price,
-        "extreme_price": highest if direction == "PUMP" else lowest
+        "start_time": int(current[0]),
+        "start_price": op,
+        "current_price": close,
+        "extreme_price": high if direction == "PUMP" else low,
+        "volume_ratio": round(relative_volume, 2),
+        "body_ratio": round(body_ratio, 3),
+        "candle_high": high,
+        "candle_low": low,
+        "active_candle": True
     }
 
 
 def _measure_symbol_impulses(exchange, symbol):
-    """Measure 5D and 8H(2x4H) impulses independently."""
+    """Measure current 1D and 4H forming-candle impulses with volume confirmation."""
     daily = None
     four_hour = None
-
     try:
-        daily = _impulse_pct(
-            exchange, symbol, "1d", DAILY_IMPULSE_LOOKBACK
-        )
+        bars = get_live_bars(exchange, symbol, "1d", IMPULSE_VOLUME_LOOKBACK + 1)
+        daily = _impulse_details_current(bars, "1d", DAILY_IMPULSE_MIN_PCT)
     except Exception as exc:
-        print(
-            f"[UNIVERSE] {symbol}: daily impulse unavailable: "
-            f"{type(exc).__name__}: {exc}",
-            flush=True
-        )
-
+        print(f"[UNIVERSE] {symbol}: current 1D impulse unavailable: {type(exc).__name__}: {exc}", flush=True)
     try:
-        four_hour = _impulse_pct(
-            exchange, symbol, "4h", FOUR_HOUR_IMPULSE_LOOKBACK
-        )
+        bars = get_live_bars(exchange, symbol, "4h", IMPULSE_VOLUME_LOOKBACK + 1)
+        four_hour = _impulse_details_current(bars, "4h", FOUR_HOUR_IMPULSE_MIN_PCT)
     except Exception as exc:
-        print(
-            f"[UNIVERSE] {symbol}: 4H impulse unavailable: "
-            f"{type(exc).__name__}: {exc}",
-            flush=True
-        )
-
+        print(f"[UNIVERSE] {symbol}: current 4H impulse unavailable: {type(exc).__name__}: {exc}", flush=True)
     return daily, four_hour
 
 
@@ -473,8 +474,8 @@ def build_stable_universe():
     measured = []
     print(
         f"[UNIVERSE] Liquidity preselection: {len(candidates)} contracts; "
-        f"checking {DAILY_IMPULSE_LOOKBACK} daily candles (5 days) and "
-        f"{FOUR_HOUR_IMPULSE_LOOKBACK} 4H candles (8 hours)...",
+        f"checking CURRENT forming 1D and 4H candles; "
+        f"volume lookback={IMPULSE_VOLUME_LOOKBACK} completed candles...",
         flush=True
     )
 
@@ -491,26 +492,20 @@ def build_stable_universe():
                 daily_impulse, four_hour_impulse = None, None
 
             # A symbol must meet at least one explicit impulse threshold.
-            daily_ok = (
-                daily_impulse is not None
-                and daily_impulse >= DAILY_IMPULSE_MIN_PCT
-            )
-            four_hour_ok = (
-                four_hour_impulse is not None
-                and four_hour_impulse >= FOUR_HOUR_IMPULSE_MIN_PCT
-            )
+            daily_ok = daily_impulse is not None
+            four_hour_ok = four_hour_impulse is not None
             if not (daily_ok or four_hour_ok):
                 continue
 
             # Rank by strength relative to the applicable threshold.
             # This lets a very strong 4H pump/dump compete with a 1D impulse.
             score_1d = (
-                daily_impulse / DAILY_IMPULSE_MIN_PCT
-                if daily_impulse is not None else 0.0
+                daily_impulse["pct"] / DAILY_IMPULSE_MIN_PCT
+                if daily_impulse else 0.0
             )
             score_4h = (
-                four_hour_impulse / FOUR_HOUR_IMPULSE_MIN_PCT
-                if four_hour_impulse is not None else 0.0
+                four_hour_impulse["pct"] / FOUR_HOUR_IMPULSE_MIN_PCT
+                if four_hour_impulse else 0.0
             )
             score = max(score_1d, score_4h)
             measured.append((
@@ -524,11 +519,11 @@ def build_stable_universe():
 
     daily_count = sum(
         1 for x in measured
-        if x[3] is not None and x[3] >= DAILY_IMPULSE_MIN_PCT
+        if x[3] is not None
     )
     four_hour_count = sum(
         1 for x in measured
-        if x[4] is not None and x[4] >= FOUR_HOUR_IMPULSE_MIN_PCT
+        if x[4] is not None
     )
 
     print(
@@ -541,8 +536,8 @@ def build_stable_universe():
 
     if selected:
         preview = ", ".join(
-            f"{x[0]}(1D={'n/a' if x[3] is None else f'{x[3]:.1f}%'}, "
-            f"4H={'n/a' if x[4] is None else f'{x[4]:.1f}%'})"
+            f"{x[0]}(1D={('n/a' if x[3] is None else f"{x[3]['pct']:.1f}% {x[3]['direction']}")}, "
+            f"4H={('n/a' if x[4] is None else f"{x[4]['pct']:.1f}% {x[4]['direction']}")})"
             for x in selected[:12]
         )
         print(f"[UNIVERSE] Strongest impulses: {preview}", flush=True)
@@ -701,6 +696,27 @@ def get_bars(exchange, symbol, interval, limit):
     )
 
     return _normalise_rows(rows, "gate")
+
+
+def get_live_bars(exchange, symbol, interval, limit):
+    """Return recent OHLCV bars including the active, not-yet-closed candle."""
+    if exchange == "okx":
+        inst_id = symbol.replace("USDT", "-USDT-SWAP")
+        bar = {"5m": "5m", "1h": "1H", "4h": "4H", "1d": "1D"}.get(interval, "1D")
+        rows = _okx_live_rows(inst_id, bar, limit)
+        return _normalise_rows(rows, "okx")
+    # Gate's futures candlestick endpoint returns the newest active bucket too.
+    return get_bars(exchange, symbol, interval, limit)
+
+
+def get_chart_bars(exchange, symbol, interval, history_limit):
+    """Historical depth plus the current live candle, de-duplicated by open time."""
+    historical = get_bars(exchange, symbol, interval, history_limit)
+    live = get_live_bars(exchange, symbol, interval, min(300, max(3, history_limit)))
+    by_time = {int(row[0]): row for row in historical}
+    for row in live:
+        by_time[int(row[0])] = row
+    return [by_time[key] for key in sorted(by_time)][-history_limit:]
 
 
 # ============================================================
@@ -1642,77 +1658,82 @@ _FONT_5X7 = {
 
 
 def _order_block_zones(bars, input_range=25):
-    """
-    Port of the supplied Pine Order Blocks core:
-    prior-range BOS, last opposite candle's tracked high/low as block bounds,
-    and removal when candle close breaks the far edge.
-    Returns active bullish/bearish zones with their creation timestamps.
+    """Faithful Python port of the supplied Pine v6 Order Blocks core.
+
+    Uses close as both breaker sources, prior inputRange highs/lows, Pine-style
+    crossunder/crossover, original candle-tracking order, and close-based invalidation.
     """
     zones = []
-    last_down_index = None
-    last_down_high = 0.0
+    last_down_index = 0
+    last_down = 0.0
     last_low = 0.0
-    last_up_index = None
+    last_up_index = 0
+    last_up = 0.0
     last_up_low = 0.0
+    last_up_open = 0.0
     last_high = 0.0
-    last_long_index = -1
+    last_long_index = 0
 
     for i, candle in enumerate(bars):
         op = float(candle["open"]); cl = float(candle["close"])
         hi = float(candle["high"]); lo = float(candle["low"])
-        if i >= input_range + 1:
+
+        if i >= input_range:
+            # Pine: ta.lowest(low, inputRange)[1] / ta.highest(high, inputRange)[1]
             prior = bars[i-input_range:i]
             structure_low = min(float(x["low"]) for x in prior)
             structure_high = max(float(x["high"]) for x in prior)
-            prev_c = float(bars[i-1]["close"])
-            prev_prior = bars[i-input_range-1:i-1]
-            prev_structure_low = min(float(x["low"]) for x in prev_prior) if len(prev_prior) == input_range else structure_low
-            prev_structure_high = max(float(x["high"]) for x in prev_prior) if len(prev_prior) == input_range else structure_high
 
-            bearish_bos = cl < structure_low and prev_c >= prev_structure_low
-            bullish_bos = cl > structure_high and prev_c <= prev_structure_high
+            if i >= input_range + 1:
+                prev_prior = bars[i-input_range-1:i-1]
+                prev_structure_low = min(float(x["low"]) for x in prev_prior)
+                prev_structure_high = max(float(x["high"]) for x in prev_prior)
+                prev_close = float(bars[i-1]["close"])
+                bearish_bos = prev_close >= prev_structure_low and cl < structure_low
+                bullish_bos = prev_close <= prev_structure_high and cl > structure_high
 
-            if bearish_bos and last_up_index is not None and i-last_up_index < 1000:
-                top = max(last_high, last_up_low)
-                bottom = min(last_high, last_up_low)
-                if top > bottom > 0:
-                    zones.append({"kind":"BEARISH", "top":top, "bottom":bottom,
-                                  "start":int(bars[last_up_index]["time"]), "active":True})
-            if bullish_bos and last_down_index is not None and i-last_down_index < 1000 and i > last_long_index:
-                top = max(last_down_high, last_low)
-                bottom = min(last_down_high, last_low)
-                if top > bottom > 0:
-                    zones.append({"kind":"BULLISH", "top":top, "bottom":bottom,
-                                  "start":int(bars[last_down_index]["time"]), "active":True})
+                # Pine uses lastHigh / lastUpLow directly for bearish OB bounds.
+                if bearish_bos and (i - last_up_index) < 1000:
+                    top = last_high
+                    bottom = last_up_low
+                    if top > bottom > 0:
+                        zones.append({"kind": "BEARISH", "top": top, "bottom": bottom,
+                                      "start": int(bars[last_up_index]["time"]), "active": True})
+
+                # Pine uses lastDown / lastLow directly for bullish OB bounds.
+                if bullish_bos and (i - last_down_index) < 1000 and i > last_long_index:
+                    top = last_down
+                    bottom = last_low
+                    if top > bottom > 0:
+                        zones.append({"kind": "BULLISH", "top": top, "bottom": bottom,
+                                      "start": int(bars[last_down_index]["time"]), "active": True})
                     last_long_index = i
 
-            # Apply the Pine block invalidation rules to all existing zones.
-            for z in zones:
-                if not z["active"]:
-                    continue
-                if z["kind"] == "BULLISH" and cl < z["bottom"]:
-                    z["active"] = False
-                elif z["kind"] == "BEARISH" and cl > z["top"]:
-                    z["active"] = False
+        # Pine's Update Blocks section executes on every bar after BOS creation.
+        for z in zones:
+            if not z["active"]:
+                continue
+            if z["kind"] == "BEARISH" and cl > z["top"]:
+                z["active"] = False
+            elif z["kind"] == "BULLISH" and cl < z["bottom"]:
+                z["active"] = False
 
-        # Pine's candle tracking: reset on each opposite candle, then keep
-        # running extreme until the next candle of that same direction.
+        # Exact candle-tracking sequence from the Pine source.
         if cl < op:
-            last_down_high = hi
+            last_down = hi
             last_down_index = i
             last_low = lo
-        elif cl > op:
+        if cl > op:
+            last_up = cl
             last_up_index = i
+            last_up_open = op
             last_up_low = lo
             last_high = hi
 
-        if last_down_index is not None:
-            last_low = min(lo, last_low)
-        if last_up_index is not None:
-            last_high = max(hi, last_high)
+        last_high = max(hi, last_high)
+        last_low = min(lo, last_low)
 
     return [z for z in zones if z["active"]]
-
 
 
 def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620, zones=None):
@@ -1816,14 +1837,14 @@ def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620, 
             x1 = left
         y1, y2 = sorted((yprice(z["top"]), yprice(z["bottom"])))
         if z["kind"] == "BULLISH":
-            zone_color = (80, 190, 130)
-            border_color = (65, 210, 145)
+            # Pine: color.rgb(192, 230, 174, 60) -> 40% opacity.
+            zone_color = (192, 230, 174)
+            blend_rect(x1, y1, right, y2, zone_color, 102)
         else:
-            zone_color = (210, 160, 65)
-            border_color = (235, 180, 75)
-        blend_rect(x1, y1, right, y2, zone_color, 48)
-        line(x1, y1, right, y1, border_color, 2)
-        line(x1, y2, right, y2, border_color, 2)
+            # Pine: color.rgb(219, 166, 50, 80) -> 20% opacity.
+            zone_color = (219, 166, 50)
+            blend_rect(x1, y1, right, y2, zone_color, 51)
+        # Pine's box border is fully transparent (color.new(gray, 100)).
 
     candle_w = max(3, min(10, int(step*0.58)))
     for i, candle in enumerate(data):
@@ -1871,10 +1892,10 @@ def send_impulse_telegram(sym, impulse_by_tf):
         chart_specs.append(("4H", impulse_by_tf["4H"], FOUR_HOUR_CHART_CANDLES))
     for tf, detail, _count in chart_specs:
         sign = "+" if detail["direction"] == "PUMP" else "-"
-        period_label = "5 ДНЕЙ" if tf == "1D" else "8 ЧАСОВ"
+        period_label = "ТЕКУЩАЯ ДНЕВНАЯ СВЕЧА" if tf == "1D" else "ТЕКУЩАЯ СВЕЧА 4H"
         captions.append(
-            f"{tf} ({period_label}): <b>{detail['direction']}</b> "
-            f"{sign}{detail['pct']:.1f}%"
+            f"{tf} ({period_label}, текущая свеча): <b>{detail['direction']}</b> "
+            f"{sign}{detail['pct']:.1f}% | объём: x{detail.get('volume_ratio', 0):.2f}"
         )
 
     try:
@@ -1882,7 +1903,7 @@ def send_impulse_telegram(sym, impulse_by_tf):
             interval = "1d" if tf == "1D" else "4h"
             # Load extended history so the Order Blocks engine can detect
             # BOS events and keep zones that originated before the visible chart.
-            history_rows = get_bars(ACTIVE_EXCHANGE, sym, interval, max(500, count))
+            history_rows = get_chart_bars(ACTIVE_EXCHANGE, sym, interval, 5000)
             history_bars = _bars_to_dict(history_rows)
             zones = _order_block_zones(history_bars, input_range=25)
             display_bars = history_bars[-count:]
@@ -2004,13 +2025,7 @@ def send_telegram_test():
 # ============================================================
 
 def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
-    """
-    Process one symbol independently.
-
-    Daily levels are invalidated by daily candles.
-    4H levels are invalidated by 4H candles.
-    Both level sets are checked against the same last 288 five-minute candles.
-    """
+    """Process false-breakout levels and independently evaluate live impulse candles."""
     try:
         days_raw = get_cached_daily_bars(exchange, sym)
         four_hour_raw = get_cached_four_hour_bars(exchange, sym)
@@ -2020,70 +2035,56 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
         bars4h = _bars_to_dict(four_hour_raw)
         m5 = _bars_to_dict(m5_raw)
 
-        if len(days) < 60 or len(bars4h) < 60 or len(m5) < 30:
-            return (
-                sym, [], [], False,
-                f"insufficient candle history "
-                f"(daily={len(days)}, 4h={len(bars4h)}, 5m={len(m5)})"
-            )
-
-        # Keep the original daily ATR calculation for daily-level alerts.
-        highs = [d["high"] for d in days[:-1]]
-        lows = [d["low"] for d in days[:-1]]
-        closes = [d["close"] for d in days[:-1]]
-        atr_value = wilder_atr(highs, lows, closes, 14)
-        last_close = days[-1]["close"]
-        daily_atr_pct = (
-            atr_value / last_close * 100
-            if atr_value and last_close > 0
-            else 0.0
-        )
-
-        # 4H ATR is displayed for 4H-level alerts, so the metric matches the level TF.
-        highs4 = [d["high"] for d in bars4h[:-1]]
-        lows4 = [d["low"] for d in bars4h[:-1]]
-        closes4 = [d["close"] for d in bars4h[:-1]]
-        atr4_value = wilder_atr(highs4, lows4, closes4, 14)
-        last_close4 = bars4h[-1]["close"]
-        atr4_pct = (
-            atr4_value / last_close4 * 100
-            if atr4_value and last_close4 > 0
-            else 0.0
-        )
-
-        daily_result = fb_compute(days, m5)
-        four_hour_result = fb_compute_4h(bars4h, m5)
-
+        # Impulse alerts use the live exchange endpoint and include the active candle.
+        live_days = get_live_bars(exchange, sym, "1d", IMPULSE_VOLUME_LOOKBACK + 1)
+        live_4h = get_live_bars(exchange, sym, "4h", IMPULSE_VOLUME_LOOKBACK + 1)
+        daily_impulse = _impulse_details_current(live_days, "1d", DAILY_IMPULSE_MIN_PCT)
+        four_hour_impulse = _impulse_details_current(live_4h, "4h", FOUR_HOUR_IMPULSE_MIN_PCT)
         impulse_data = {}
-        daily_impulse = _impulse_details(days, DAILY_IMPULSE_LOOKBACK)
-        four_hour_impulse = _impulse_details(bars4h, FOUR_HOUR_IMPULSE_LOOKBACK)
-        if daily_impulse and daily_impulse["pct"] >= DAILY_IMPULSE_MIN_PCT:
+        if daily_impulse:
             impulse_data["1D"] = daily_impulse
-        if four_hour_impulse and four_hour_impulse["pct"] >= FOUR_HOUR_IMPULSE_MIN_PCT:
+        if four_hour_impulse:
             impulse_data["4H"] = four_hour_impulse
 
         discovered = []
         seed_keys = []
 
-        combined = (
-            [(event, daily_atr_pct) for event in daily_result["events"]]
-            + [(event, atr4_pct) for event in four_hour_result["events"]]
-        )
+        # False-breakout engine requires its own history; lack of it must not
+        # suppress an otherwise valid live pump/dump notification.
+        if len(m5) >= 30:
+            if len(days) >= 60:
+                highs = [d["high"] for d in days[:-1]]
+                lows = [d["low"] for d in days[:-1]]
+                closes = [d["close"] for d in days[:-1]]
+                atr_value = wilder_atr(highs, lows, closes, 14)
+                last_close = days[-1]["close"]
+                daily_atr_pct = atr_value / last_close * 100 if atr_value and last_close > 0 else 0.0
+                daily_result = fb_compute(days, m5)
+                for event in daily_result["events"]:
+                    event.setdefault("timeframe", "1D")
+                    key = (f"{sym}|{event['timeframe']}|{event['side']}|{event['time']}|"
+                           f"{event['price']:.12g}|{event['touch']}")
+                    if is_new_symbol:
+                        seed_keys.append(key)
+                    elif key not in seen_snapshot:
+                        discovered.append((sym, event, daily_atr_pct, key))
 
-        for event, atr_pct in combined:
-            # Mark the original daily engine's events without changing its logic.
-            if "timeframe" not in event:
-                event["timeframe"] = "1D"
-
-            key = (
-                f"{sym}|{event['timeframe']}|{event['side']}|"
-                f"{event['time']}|{event['price']:.12g}|{event['touch']}"
-            )
-
-            if is_new_symbol:
-                seed_keys.append(key)
-            elif key not in seen_snapshot:
-                discovered.append((sym, event, atr_pct, key))
+            if len(bars4h) >= 60:
+                highs4 = [d["high"] for d in bars4h[:-1]]
+                lows4 = [d["low"] for d in bars4h[:-1]]
+                closes4 = [d["close"] for d in bars4h[:-1]]
+                atr4_value = wilder_atr(highs4, lows4, closes4, 14)
+                last_close4 = bars4h[-1]["close"]
+                atr4_pct = atr4_value / last_close4 * 100 if atr4_value and last_close4 > 0 else 0.0
+                four_hour_result = fb_compute_4h(bars4h, m5)
+                for event in four_hour_result["events"]:
+                    event.setdefault("timeframe", "4H")
+                    key = (f"{sym}|{event['timeframe']}|{event['side']}|{event['time']}|"
+                           f"{event['price']:.12g}|{event['touch']}")
+                    if is_new_symbol:
+                        seed_keys.append(key)
+                    elif key not in seen_snapshot:
+                        discovered.append((sym, event, atr4_pct, key))
 
         return sym, discovered, seed_keys, impulse_data, True, None
 
@@ -2106,7 +2107,11 @@ def main():
     )
 
     print(
-        f"[CONFIG] swing={FB['swing']}; "
+        f"[CONFIG] live_impulse_1D={DAILY_IMPULSE_MIN_PCT:.0f}%; "
+        f"live_impulse_4H={FOUR_HOUR_IMPULSE_MIN_PCT:.0f}%; "
+        f"volume_ratio>={IMPULSE_MIN_RELATIVE_VOLUME:.2f}; "
+        f"body_ratio>={IMPULSE_MIN_BODY_RATIO:.2f}; "
+        f"swing={FB['swing']}; "
         f"minSwingAtr={FB['minSwingAtr']}; "
         f"max_monitored={MAX_MONITORED}; "
         f"workers={SCAN_WORKERS}; "
