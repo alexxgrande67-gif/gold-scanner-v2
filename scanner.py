@@ -59,13 +59,12 @@ FB = {
 TOP_UNIVERSE = 500
 # Liquidity preselection pool. Activity ranking is then calculated inside it.
 UNIVERSE_CANDIDATES = 1000
-# Intrabar impulse filters: evaluate the currently forming candle, not old candles.
+# Intrabar impulse thresholds: evaluate the currently forming candle.
+# Volume and candle-body ratios are informational only; they do not block alerts.
 DAILY_IMPULSE_MIN_PCT = 50.0
 FOUR_HOUR_IMPULSE_MIN_PCT = 25.0
 IMPULSE_REPEAT_STEP_PCT = 20.0   # resend after an additional 20 percentage points
-IMPULSE_VOLUME_LOOKBACK = 20     # compare current volume pace with 20 completed candles
-IMPULSE_MIN_RELATIVE_VOLUME = 1.20
-IMPULSE_MIN_BODY_RATIO = 0.55    # candle body / full high-low range
+IMPULSE_VOLUME_LOOKBACK = 20     # completed candles used for informational volume comparison
 DAILY_CHART_CANDLES = 90
 FOUR_HOUR_CHART_CANDLES = 72
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
@@ -381,14 +380,28 @@ def _gate_universe():
 
 
 def _impulse_details_current(bars, interval, min_pct=None, now_ts=None):
-    """Evaluate only the active candle: signed open-to-current-close move + volume pace."""
-    if len(bars) < IMPULSE_VOLUME_LOOKBACK + 1:
+    """
+    Evaluate the currently forming candle using signed open-to-current-price move.
+
+    The move threshold is the only qualification filter. Relative volume and
+    candle-body/range are calculated for context and Telegram reporting, but
+    never suppress a qualifying pump or dump.
+    """
+    if not bars:
         return None
+
     now_ts = int(now_ts or time.time())
     current = bars[-1]
-    previous = bars[-(IMPULSE_VOLUME_LOOKBACK + 1):-1]
-    op = float(current[1]); high = float(current[2]); low = float(current[3]); close = float(current[4])
-    current_volume = max(0.0, float(current[5]))
+
+    try:
+        op = float(current[1])
+        high = float(current[2])
+        low = float(current[3])
+        close = float(current[4])
+        current_volume = max(0.0, float(current[5]))
+    except (TypeError, ValueError, IndexError):
+        return None
+
     if op <= 0 or close <= 0 or high < low:
         return None
 
@@ -399,22 +412,36 @@ def _impulse_details_current(bars, interval, min_pct=None, now_ts=None):
     body = abs(close - op)
     body_ratio = body / candle_range if candle_range > 0 else 0.0
 
-    duration = 86400 if interval == "1d" else 14400
-    elapsed = max(0.05, min(1.0, (now_ts - int(current[0])) / duration))
-    previous_volumes = [max(0.0, float(row[5])) for row in previous]
-    avg_volume = sum(previous_volumes) / len(previous_volumes) if previous_volumes else 0.0
-    expected_volume = avg_volume * elapsed
-    relative_volume = current_volume / expected_volume if expected_volume > 0 else 0.0
+    # Informational relative-volume estimate, not an eligibility condition.
+    previous = bars[-(IMPULSE_VOLUME_LOOKBACK + 1):-1]
+    previous_volumes = []
+    for row in previous:
+        try:
+            previous_volumes.append(max(0.0, float(row[5])))
+        except (TypeError, ValueError, IndexError):
+            continue
 
-    # All filters apply to the current forming candle; no completed-candle delay.
+    duration = 86400 if interval == "1d" else 14400
+    elapsed = max(0.01, min(1.0, (now_ts - int(current[0])) / duration))
+    avg_volume = (
+        sum(previous_volumes) / len(previous_volumes)
+        if previous_volumes else 0.0
+    )
+    expected_volume = avg_volume * elapsed
+    relative_volume = (
+        current_volume / expected_volume
+        if expected_volume > 0 else 0.0
+    )
+
     threshold = min_pct
     if threshold is None:
-        threshold = DAILY_IMPULSE_MIN_PCT if interval == "1d" else FOUR_HOUR_IMPULSE_MIN_PCT
+        threshold = (
+            DAILY_IMPULSE_MIN_PCT
+            if interval == "1d"
+            else FOUR_HOUR_IMPULSE_MIN_PCT
+        )
+
     if move_pct < threshold:
-        return None
-    if body_ratio < IMPULSE_MIN_BODY_RATIO:
-        return None
-    if relative_volume < IMPULSE_MIN_RELATIVE_VOLUME:
         return None
 
     return {
@@ -431,7 +458,6 @@ def _impulse_details_current(bars, interval, min_pct=None, now_ts=None):
         "candle_low": low,
         "active_candle": True
     }
-
 
 def _measure_symbol_impulses(exchange, symbol):
     """Measure current 1D and 4H forming-candle impulses with volume confirmation."""
@@ -451,13 +477,18 @@ def _measure_symbol_impulses(exchange, symbol):
 
 
 def build_stable_universe():
-    """Select only liquid USDT perpetuals with a strong recent 1D or 4H impulse."""
+    """
+    Return a separate liquid monitoring universe for false-breakout scanning.
+
+    Impulse qualification is deliberately independent: each monitored symbol
+    is checked for a live 1D >= 50% or 4H >= 25% move in process_symbol().
+    This prevents the impulse filter from shrinking the false-breakout universe.
+    """
     global ACTIVE_EXCHANGE
 
     try:
         candidates = _okx_universe()
         ACTIVE_EXCHANGE = "okx"
-
     except Exception as exc:
         print(
             f"[WARN] OKX universe unavailable; "
@@ -468,89 +499,31 @@ def build_stable_universe():
         ACTIVE_EXCHANGE = "gate"
 
     if not candidates:
+        print("[UNIVERSE] No liquid USDT perpetual contracts returned.", flush=True)
         return []
 
-    exchange = ACTIVE_EXCHANGE
-    measured = []
+    limit = min(TOP_UNIVERSE, MAX_MONITORED)
+    selected = candidates[:limit]
+
     print(
         f"[UNIVERSE] Liquidity preselection: {len(candidates)} contracts; "
-        f"checking CURRENT forming 1D and 4H candles; "
-        f"volume lookback={IMPULSE_VOLUME_LOOKBACK} completed candles...",
-        flush=True
-    )
-
-    with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, 10)) as executor:
-        futures = {
-            executor.submit(_measure_symbol_impulses, exchange, item[0]): item
-            for item in candidates
-        }
-        for future in as_completed(futures):
-            sym, turnover, change_24h = futures[future]
-            try:
-                daily_impulse, four_hour_impulse = future.result()
-            except Exception:
-                daily_impulse, four_hour_impulse = None, None
-
-            # A symbol must meet at least one explicit impulse threshold.
-            daily_ok = daily_impulse is not None
-            four_hour_ok = four_hour_impulse is not None
-            if not (daily_ok or four_hour_ok):
-                continue
-
-            # Rank by strength relative to the applicable threshold.
-            # This lets a very strong 4H pump/dump compete with a 1D impulse.
-            score_1d = (
-                daily_impulse["pct"] / DAILY_IMPULSE_MIN_PCT
-                if daily_impulse else 0.0
-            )
-            score_4h = (
-                four_hour_impulse["pct"] / FOUR_HOUR_IMPULSE_MIN_PCT
-                if four_hour_impulse else 0.0
-            )
-            score = max(score_1d, score_4h)
-            measured.append((
-                sym, turnover, change_24h,
-                daily_impulse, four_hour_impulse, score
-            ))
-
-    measured.sort(key=lambda x: (x[5], x[1]), reverse=True)
-    limit = min(TOP_UNIVERSE, MAX_MONITORED)
-    selected = measured[:limit]
-
-    daily_count = sum(
-        1 for x in measured
-        if x[3] is not None
-    )
-    four_hour_count = sum(
-        1 for x in measured
-        if x[4] is not None
-    )
-
-    print(
-        f"[UNIVERSE] Qualified={len(measured)}; selected={len(selected)}; "
-        f"1D >= {DAILY_IMPULSE_MIN_PCT:.0f}%: {daily_count}; "
-        f"4H >= {FOUR_HOUR_IMPULSE_MIN_PCT:.0f}%: {four_hour_count}; "
-        f"exchange={ACTIVE_EXCHANGE}",
+        f"monitoring top {len(selected)} by 24h quote turnover. "
+        f"Live impulse alerts are checked independently: "
+        f"1D >= {DAILY_IMPULSE_MIN_PCT:.0f}% OR "
+        f"4H >= {FOUR_HOUR_IMPULSE_MIN_PCT:.0f}%.",
         flush=True
     )
 
     if selected:
         preview = ", ".join(
-            f"{x[0]}(1D={('n/a' if x[3] is None else f"{x[3]['pct']:.1f}% {x[3]['direction']}")}, "
-            f"4H={('n/a' if x[4] is None else f"{x[4]['pct']:.1f}% {x[4]['direction']}")})"
-            for x in selected[:12]
+            f"{sym}(${turnover / 1_000_000:.1f}M)"
+            for sym, turnover, _ in selected[:10]
         )
-        print(f"[UNIVERSE] Strongest impulses: {preview}", flush=True)
-    else:
-        print(
-            "[UNIVERSE] No contracts met the configured impulse thresholds; "
-            "scanner will not substitute weaker movers.",
-            flush=True
-        )
+        print(f"[UNIVERSE] Highest-turnover monitored contracts: {preview}", flush=True)
 
     return [
         (sym, turnover, None)
-        for sym, turnover, _, _, _, _ in selected
+        for sym, turnover, _ in selected
     ]
 
 
@@ -2109,8 +2082,7 @@ def main():
     print(
         f"[CONFIG] live_impulse_1D={DAILY_IMPULSE_MIN_PCT:.0f}%; "
         f"live_impulse_4H={FOUR_HOUR_IMPULSE_MIN_PCT:.0f}%; "
-        f"volume_ratio>={IMPULSE_MIN_RELATIVE_VOLUME:.2f}; "
-        f"body_ratio>={IMPULSE_MIN_BODY_RATIO:.2f}; "
+        "volume/body filters=informational only; "
         f"swing={FB['swing']}; "
         f"minSwingAtr={FB['minSwingAtr']}; "
         f"max_monitored={MAX_MONITORED}; "
@@ -2147,9 +2119,14 @@ def main():
     )
 
     if not symbols:
-        raise RuntimeError(
-            "No symbols available in the selected universe"
+        print(
+            "[INFO] No symbols available in the selected universe; "
+            "nothing to scan. Run completed without error.",
+            flush=True
         )
+        save_daily_cache()
+        save_four_hour_cache()
+        return
 
     state = load_state()
 
