@@ -9,6 +9,8 @@ import math
 import os
 import time
 import threading
+import struct
+import zlib
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -64,6 +66,9 @@ FOUR_HOUR_IMPULSE_MIN_PCT = 25.0
 # high/low reached inside each rolling window.
 DAILY_IMPULSE_LOOKBACK = 7       # last 7 daily candles
 FOUR_HOUR_IMPULSE_LOOKBACK = 6   # last 6 four-hour candles (24 hours)
+IMPULSE_REPEAT_STEP_PCT = 20.0   # resend after an additional 20 percentage points
+DAILY_CHART_CANDLES = 90
+FOUR_HOUR_CHART_CANDLES = 72
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
 
 SCAN_WORKERS = max(
@@ -380,6 +385,38 @@ def _impulse_pct(exchange, symbol, interval, lookback):
     up_pct = (highest / start_price - 1.0) * 100.0
     down_pct = (1.0 - lowest / start_price) * 100.0
     return max(0.0, up_pct, down_pct)
+
+
+def _impulse_details(bars, lookback):
+    """Return the strongest signed excursion from the first candle open."""
+    if len(bars) < lookback:
+        return None
+
+    window = bars[-lookback:]
+    first = window[0]
+    start_price = float(first["open"] if isinstance(first, dict) else first[1])
+    if start_price <= 0:
+        return None
+
+    highest = max(float(x["high"] if isinstance(x, dict) else x[2]) for x in window)
+    lowest = min(float(x["low"] if isinstance(x, dict) else x[3]) for x in window)
+    up_pct = (highest / start_price - 1.0) * 100.0
+    down_pct = (1.0 - lowest / start_price) * 100.0
+
+    if up_pct >= down_pct:
+        direction = "PUMP"
+        value = up_pct
+    else:
+        direction = "DUMP"
+        value = down_pct
+
+    return {
+        "pct": round(max(0.0, value), 2),
+        "direction": direction,
+        "start_time": int(first["time"] if isinstance(first, dict) else first[0]),
+        "start_price": start_price,
+        "extreme_price": highest if direction == "PUMP" else lowest
+    }
 
 
 def _measure_symbol_impulses(exchange, symbol):
@@ -1493,7 +1530,8 @@ def load_state():
     return {
         "primed": False,
         "seen": [],
-        "seeded_symbols": []
+        "seeded_symbols": [],
+        "impulse_alerts": {}
     }
 
 
@@ -1547,6 +1585,167 @@ def telegram_post(message, timeout=20):
             flush=True
         )
 
+        return False
+
+
+def _png_chunk(chunk_type, data):
+    body = chunk_type + data
+    return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+
+
+def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620):
+    """Render a compact candlestick chart using only the Python standard library."""
+    data = bars[-max_candles:]
+    if len(data) < 2:
+        raise ValueError("Not enough candles to render chart")
+
+    # RGB canvas. Dark TradingView-like chart, no external imaging dependency.
+    bg = (15, 23, 42)
+    grid = (43, 55, 75)
+    up = (22, 190, 130)
+    down = (239, 76, 86)
+    text_color = (220, 228, 240)
+    pixels = bytearray(bg * (width * height))
+
+    def pixel(x, y, color):
+        if 0 <= x < width and 0 <= y < height:
+            i = (y * width + x) * 3
+            pixels[i:i+3] = bytes(color)
+
+    def line(x1, y1, x2, y2, color, thickness=1):
+        dx = abs(x2-x1); sx = 1 if x1 < x2 else -1
+        dy = -abs(y2-y1); sy = 1 if y1 < y2 else -1
+        err = dx + dy
+        while True:
+            for ox in range(-(thickness//2), thickness//2+1):
+                for oy in range(-(thickness//2), thickness//2+1):
+                    pixel(x1+ox, y1+oy, color)
+            if x1 == x2 and y1 == y2:
+                break
+            e2 = 2 * err
+            if e2 >= dy:
+                err += dy; x1 += sx
+            if e2 <= dx:
+                err += dx; y1 += sy
+
+    def rect(x1, y1, x2, y2, color):
+        for yy in range(max(0, y1), min(height, y2+1)):
+            for xx in range(max(0, x1), min(width, x2+1)):
+                pixel(xx, yy, color)
+
+    left, right, top, bottom = 65, width-28, 78, height-48
+    highs = [float(x["high"]) for x in data]
+    lows = [float(x["low"]) for x in data]
+    lo, hi = min(lows), max(highs)
+    pad = (hi-lo)*0.06 if hi > lo else max(abs(hi)*0.02, 0.01)
+    lo -= pad; hi += pad
+    span = hi-lo or 1.0
+
+    def yprice(value):
+        return int(bottom - (value-lo)/span*(bottom-top))
+
+    for i in range(6):
+        y = top + (bottom-top)*i//5
+        line(left, y, right, y, grid)
+    for i in range(9):
+        x = left + (right-left)*i//8
+        line(x, top, x, bottom, grid)
+
+    step = (right-left)/len(data)
+    candle_w = max(3, min(10, int(step*0.58)))
+    for i, candle in enumerate(data):
+        x = int(left + (i+0.5)*step)
+        op = float(candle["open"]); cl = float(candle["close"])
+        high = float(candle["high"]); low = float(candle["low"])
+        color = up if cl >= op else down
+        line(x, yprice(high), x, yprice(low), color, 2)
+        y1, y2 = sorted((yprice(op), yprice(cl)))
+        if y2-y1 < 2:
+            y2 = y1+2
+        rect(x-candle_w//2, y1, x+candle_w//2, y2, color)
+
+    # Current price marker.
+    last_price = float(data[-1]["close"])
+    ylast = yprice(last_price)
+    line(left, ylast, right, ylast, (235, 190, 70), 1)
+
+    # Tiny bitmap-free title band and price metadata are intentionally omitted;
+    # the Telegram caption carries symbol, timeframe and measured impulse.
+    raw = bytearray()
+    stride = width*3
+    for y in range(height):
+        raw.append(0)
+        raw.extend(pixels[y*stride:(y+1)*stride])
+    png = b"\x89PNG\r\n\x1a\n"
+    png += _png_chunk(b"IHDR", struct.pack(">2I5B", width, height, 8, 2, 0, 0, 0))
+    png += _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
+    png += _png_chunk(b"IEND", b"")
+    return png
+
+
+def send_impulse_telegram(sym, impulse_by_tf):
+    """Send one Telegram media group with one or two timeframe charts."""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        print("[ERROR] Telegram credentials are missing", flush=True)
+        return False
+
+    captions = ["🚀 <b>ОБНАРУЖЕН МОЩНЫЙ ИМПУЛЬС</b>", f"Монета: <b>{html.escape(sym)}</b>"]
+    media = []
+    files = {}
+    chart_specs = []
+    if "1D" in impulse_by_tf:
+        chart_specs.append(("1D", impulse_by_tf["1D"], DAILY_CHART_CANDLES))
+    if "4H" in impulse_by_tf:
+        chart_specs.append(("4H", impulse_by_tf["4H"], FOUR_HOUR_CHART_CANDLES))
+    for tf, detail, _count in chart_specs:
+        sign = "+" if detail["direction"] == "PUMP" else "-"
+        captions.append(f"{tf}: <b>{detail['direction']}</b> {sign}{detail['pct']:.1f}%")
+
+    try:
+        for index, (tf, detail, count) in enumerate(chart_specs):
+            interval = "1d" if tf == "1D" else "4h"
+            rows = get_bars(ACTIVE_EXCHANGE, sym, interval, count)
+            bars = _bars_to_dict(rows)
+            image_bytes = render_candlestick_png(bars, f"{sym} {tf}", count)
+            filename = f"chart_{index}.png"
+            files[filename] = (filename, image_bytes, "image/png")
+            media_item = {
+                "type": "photo",
+                "media": f"attach://{filename}"
+            }
+            if index == 0:
+                media_item["caption"] = "\n".join(captions)
+                media_item["parse_mode"] = "HTML"
+            media.append(media_item)
+
+        if len(media) == 1:
+            filename, file_tuple = next(iter(files.items()))
+            url = f"https://api.telegram.org/bot{token}/sendPhoto"
+            response = requests.post(
+                url,
+                data={"chat_id": chat_id, "caption": "\n".join(captions), "parse_mode": "HTML"},
+                files={"photo": file_tuple},
+                timeout=45
+            )
+        else:
+            url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
+            response = requests.post(
+                url,
+                data={"chat_id": chat_id, "media": json.dumps(media, ensure_ascii=False)},
+                files=files,
+                timeout=45
+            )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok") is True:
+            print(f"[TELEGRAM] Impulse alert sent: {sym} ({','.join(impulse_by_tf)})", flush=True)
+            return True
+        print("[ERROR] Telegram media group rejected: " + str(result.get("description", "unknown error")), flush=True)
+        return False
+    except Exception as exc:
+        print(f"[ERROR] Impulse chart delivery failed for {sym}: {type(exc).__name__}: {exc}", flush=True)
         return False
 
 
@@ -1673,6 +1872,14 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
         daily_result = fb_compute(days, m5)
         four_hour_result = fb_compute_4h(bars4h, m5)
 
+        impulse_data = {}
+        daily_impulse = _impulse_details(days, DAILY_IMPULSE_LOOKBACK)
+        four_hour_impulse = _impulse_details(bars4h, FOUR_HOUR_IMPULSE_LOOKBACK)
+        if daily_impulse and daily_impulse["pct"] >= DAILY_IMPULSE_MIN_PCT:
+            impulse_data["1D"] = daily_impulse
+        if four_hour_impulse and four_hour_impulse["pct"] >= FOUR_HOUR_IMPULSE_MIN_PCT:
+            impulse_data["4H"] = four_hour_impulse
+
         discovered = []
         seed_keys = []
 
@@ -1696,10 +1903,10 @@ def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
             elif key not in seen_snapshot:
                 discovered.append((sym, event, atr_pct, key))
 
-        return sym, discovered, seed_keys, True, None
+        return sym, discovered, seed_keys, impulse_data, True, None
 
     except Exception as exc:
-        return sym, [], [], False, f"{type(exc).__name__}: {exc}"
+        return sym, [], [], {}, False, f"{type(exc).__name__}: {exc}"
 
 
 # ============================================================
@@ -1771,6 +1978,7 @@ def main():
 
     discovered = []
     seed_keys = []
+    impulse_candidates = {}
 
     successful_symbols = 0
     failed_symbols = 0
@@ -1812,6 +2020,7 @@ def main():
                     result_sym,
                     symbol_events,
                     symbol_seed_keys,
+                    symbol_impulses,
                     success,
                     error
                 ) = future.result()
@@ -1826,6 +2035,8 @@ def main():
                     seed_keys.extend(
                         symbol_seed_keys
                     )
+                    if symbol_impulses:
+                        impulse_candidates[result_sym] = symbol_impulses
 
                     seeded.add(result_sym)
 
@@ -1911,6 +2122,51 @@ def main():
         else:
             failed_count += 1
 
+    # Impulse alerts are independent from false-breakout alerts.
+    # First qualifying appearance is sent; same-direction continuation is resent
+    # only after another +20 percentage points. Direction change starts a new alert.
+    impulse_alerts = state.get("impulse_alerts", {})
+    if not isinstance(impulse_alerts, dict):
+        impulse_alerts = {}
+
+    impulse_sent_count = 0
+    impulse_failed_count = 0
+    now_ts = int(time.time())
+
+    for sym, details in sorted(impulse_candidates.items()):
+        previous = impulse_alerts.get(sym, {})
+        if not isinstance(previous, dict):
+            previous = {}
+
+        notify = {}
+        for tf, detail in details.items():
+            old = previous.get(tf, {})
+            old_pct = float(old.get("pct", 0.0)) if isinstance(old, dict) else 0.0
+            old_direction = old.get("direction") if isinstance(old, dict) else None
+            old_time = int(old.get("sent_at", 0)) if isinstance(old, dict) else 0
+            stale = old_time and (now_ts - old_time > 7 * 86400)
+            is_new = not old or stale
+            direction_changed = old_direction and old_direction != detail["direction"]
+            strengthened = detail["pct"] >= old_pct + IMPULSE_REPEAT_STEP_PCT
+            if is_new or direction_changed or strengthened:
+                notify[tf] = detail
+
+        if not notify:
+            continue
+
+        if send_impulse_telegram(sym, notify):
+            for tf, detail in notify.items():
+                previous[tf] = {
+                    "pct": detail["pct"],
+                    "direction": detail["direction"],
+                    "sent_at": now_ts
+                }
+            impulse_alerts[sym] = previous
+            impulse_sent_count += 1
+        else:
+            impulse_failed_count += 1
+
+    state["impulse_alerts"] = impulse_alerts
     state["seeded_symbols"] = sorted(seeded)
     state["seen"] = sorted(seen)[-10000:]
 
@@ -1931,6 +2187,8 @@ def main():
         f"new candidates={len(discovered)}; "
         f"telegram sent={sent_count}; "
         f"telegram failed={failed_count}; "
+        f"impulse alerts sent={impulse_sent_count}; "
+        f"impulse alerts failed={impulse_failed_count}; "
         f"exchange={exchange}; "
         f"elapsed={elapsed:.1f}s",
         flush=True
