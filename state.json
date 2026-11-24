@@ -1417,9 +1417,9 @@
     },
     "NESUSDT": {
       "1D": {
-        "pct": 70.87,
-        "direction": "PUMP",
-        "sent_at": 1795528862
+        "pct": 56.65,
+        "direction": "DUMP",
+        "sent_at": 1795530163
       }
     },
     "PIEVERSEUSDT": {
@@ -1469,6 +1469,13 @@
         "pct": 57.57,
         "direction": "PUMP",
         "sent_at": 1795528862
+      }
+    },
+    "SOXSUSDT": {
+      "1D": {
+        "pct": 50.3,
+        "direction": "PUMP",
+        "sent_at": 1795530163
       }
     }
   }
