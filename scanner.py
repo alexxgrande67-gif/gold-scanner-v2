@@ -57,6 +57,13 @@ FB = {
 TOP_UNIVERSE = 500
 # Liquidity preselection pool. Activity ranking is then calculated inside it.
 UNIVERSE_CANDIDATES = 1000
+# Strict impulse filters for the dynamic universe.
+DAILY_IMPULSE_MIN_PCT = 50.0
+FOUR_HOUR_IMPULSE_MIN_PCT = 25.0
+# Measure a recent impulse from the first candle's open to the furthest
+# high/low reached inside each rolling window.
+DAILY_IMPULSE_LOOKBACK = 7       # last 7 daily candles
+FOUR_HOUR_IMPULSE_LOOKBACK = 6   # last 6 four-hour candles (24 hours)
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
 
 SCAN_WORKERS = max(
@@ -357,49 +364,56 @@ def _gate_universe():
     return items[:UNIVERSE_CANDIDATES]
 
 
-def _recent_range_pct(exchange, symbol):
-    """Range of the latest six 1H candles, expressed as a percentage."""
-    rows = get_bars(exchange, symbol, "1h", 6)
-
-    if len(rows) < 3:
+def _impulse_pct(exchange, symbol, interval, lookback):
+    """Largest directional excursion from the first candle's open."""
+    rows = get_bars(exchange, symbol, interval, lookback)
+    if len(rows) < lookback:
         return None
 
-    highs = [row[2] for row in rows]
-    lows = [row[3] for row in rows]
-    last_close = rows[-1][4]
-
-    if last_close <= 0:
+    window = rows[-lookback:]
+    start_price = float(window[0][1])
+    if start_price <= 0:
         return None
 
-    return (max(highs) - min(lows)) / last_close * 100.0
+    highest = max(float(row[2]) for row in window)
+    lowest = min(float(row[3]) for row in window)
+    up_pct = (highest / start_price - 1.0) * 100.0
+    down_pct = (1.0 - lowest / start_price) * 100.0
+    return max(0.0, up_pct, down_pct)
 
 
-def _percentile_ranks(values):
-    """Return 0..1 percentile ranks, preserving equal-value ties."""
-    if not values:
-        return []
+def _measure_symbol_impulses(exchange, symbol):
+    """Measure 7D and 24H(6x4H) impulses independently."""
+    daily = None
+    four_hour = None
 
-    ordered = sorted(range(len(values)), key=lambda i: values[i])
-    ranks = [0.0] * len(values)
-    if len(values) == 1:
-        return [1.0]
+    try:
+        daily = _impulse_pct(
+            exchange, symbol, "1d", DAILY_IMPULSE_LOOKBACK
+        )
+    except Exception as exc:
+        print(
+            f"[UNIVERSE] {symbol}: daily impulse unavailable: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True
+        )
 
-    pos = 0
-    while pos < len(ordered):
-        end = pos + 1
-        value = values[ordered[pos]]
-        while end < len(ordered) and values[ordered[end]] == value:
-            end += 1
-        rank = ((pos + end - 1) / 2) / (len(values) - 1)
-        for j in range(pos, end):
-            ranks[ordered[j]] = rank
-        pos = end
+    try:
+        four_hour = _impulse_pct(
+            exchange, symbol, "4h", FOUR_HOUR_IMPULSE_LOOKBACK
+        )
+    except Exception as exc:
+        print(
+            f"[UNIVERSE] {symbol}: 4H impulse unavailable: "
+            f"{type(exc).__name__}: {exc}",
+            flush=True
+        )
 
-    return ranks
+    return daily, four_hour
 
 
 def build_stable_universe():
-    """Build a fresh universe ranked by 24H movement and recent 6H volatility."""
+    """Select only liquid USDT perpetuals with a strong recent 1D or 4H impulse."""
     global ACTIVE_EXCHANGE
 
     try:
@@ -412,7 +426,6 @@ def build_stable_universe():
             f"using Gate.io: {type(exc).__name__}: {exc}",
             flush=True
         )
-
         candidates = _gate_universe()
         ACTIVE_EXCHANGE = "gate"
 
@@ -421,72 +434,91 @@ def build_stable_universe():
 
     exchange = ACTIVE_EXCHANGE
     measured = []
-    failed_volatility = 0
-
     print(
         f"[UNIVERSE] Liquidity preselection: {len(candidates)} contracts; "
-        f"measuring latest 6 hourly candles...",
+        f"checking {DAILY_IMPULSE_LOOKBACK} daily candles and "
+        f"{FOUR_HOUR_IMPULSE_LOOKBACK} 4H candles...",
         flush=True
     )
 
     with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, 10)) as executor:
         futures = {
-            executor.submit(_recent_range_pct, exchange, item[0]): item
+            executor.submit(_measure_symbol_impulses, exchange, item[0]): item
             for item in candidates
         }
-
         for future in as_completed(futures):
             sym, turnover, change_24h = futures[future]
             try:
-                recent_range = future.result()
-                if recent_range is None:
-                    failed_volatility += 1
-                    continue
-                measured.append((sym, turnover, change_24h, recent_range))
+                daily_impulse, four_hour_impulse = future.result()
             except Exception:
-                failed_volatility += 1
+                daily_impulse, four_hour_impulse = None, None
 
-    # If recent candles are temporarily unavailable for some contracts,
-    # retain them with zero recent range rather than silently shrinking the pool.
-    if len(measured) < min(TOP_UNIVERSE, len(candidates)):
-        measured_symbols = {item[0] for item in measured}
-        for sym, turnover, change_24h in candidates:
-            if sym not in measured_symbols:
-                measured.append((sym, turnover, change_24h, 0.0))
+            # A symbol must meet at least one explicit impulse threshold.
+            daily_ok = (
+                daily_impulse is not None
+                and daily_impulse >= DAILY_IMPULSE_MIN_PCT
+            )
+            four_hour_ok = (
+                four_hour_impulse is not None
+                and four_hour_impulse >= FOUR_HOUR_IMPULSE_MIN_PCT
+            )
+            if not (daily_ok or four_hour_ok):
+                continue
 
-    abs_24h = [abs(item[2]) for item in measured]
-    recent_ranges = [item[3] for item in measured]
-    rank_24h = _percentile_ranks(abs_24h)
-    rank_recent = _percentile_ranks(recent_ranges)
+            # Rank by strength relative to the applicable threshold.
+            # This lets a very strong 4H pump/dump compete with a 1D impulse.
+            score_1d = (
+                daily_impulse / DAILY_IMPULSE_MIN_PCT
+                if daily_impulse is not None else 0.0
+            )
+            score_4h = (
+                four_hour_impulse / FOUR_HOUR_IMPULSE_MIN_PCT
+                if four_hour_impulse is not None else 0.0
+            )
+            score = max(score_1d, score_4h)
+            measured.append((
+                sym, turnover, change_24h,
+                daily_impulse, four_hour_impulse, score
+            ))
 
-    ranked = []
-    for item, r24, rrecent in zip(measured, rank_24h, rank_recent):
-        sym, turnover, change_24h, recent_range = item
-        activity_score = 0.5 * r24 + 0.5 * rrecent
-        ranked.append((sym, turnover, change_24h, recent_range, activity_score))
-
-    ranked.sort(key=lambda x: (x[4], x[1]), reverse=True)
+    measured.sort(key=lambda x: (x[5], x[1]), reverse=True)
     limit = min(TOP_UNIVERSE, MAX_MONITORED)
-    selected = ranked[:limit]
+    selected = measured[:limit]
+
+    daily_count = sum(
+        1 for x in measured
+        if x[3] is not None and x[3] >= DAILY_IMPULSE_MIN_PCT
+    )
+    four_hour_count = sum(
+        1 for x in measured
+        if x[4] is not None and x[4] >= FOUR_HOUR_IMPULSE_MIN_PCT
+    )
 
     print(
-        f"[UNIVERSE] Ranked={len(ranked)}; selected={len(selected)}; "
-        f"volatility data fallbacks={failed_volatility}; "
-        f"score=50% |24H change| rank + 50% 6H range rank; "
+        f"[UNIVERSE] Qualified={len(measured)}; selected={len(selected)}; "
+        f"1D >= {DAILY_IMPULSE_MIN_PCT:.0f}%: {daily_count}; "
+        f"4H >= {FOUR_HOUR_IMPULSE_MIN_PCT:.0f}%: {four_hour_count}; "
         f"exchange={ACTIVE_EXCHANGE}",
         flush=True
     )
 
     if selected:
         preview = ", ".join(
-            f"{x[0]}(24h={x[2]:+.1f}%,6hRange={x[3]:.1f}%)"
-            for x in selected[:8]
+            f"{x[0]}(1D={'n/a' if x[3] is None else f'{x[3]:.1f}%'}, "
+            f"4H={'n/a' if x[4] is None else f'{x[4]:.1f}%'})"
+            for x in selected[:12]
         )
-        print(f"[UNIVERSE] Most active: {preview}", flush=True)
+        print(f"[UNIVERSE] Strongest impulses: {preview}", flush=True)
+    else:
+        print(
+            "[UNIVERSE] No contracts met the configured impulse thresholds; "
+            "scanner will not substitute weaker movers.",
+            flush=True
+        )
 
     return [
         (sym, turnover, None)
-        for sym, turnover, _, _, _ in selected
+        for sym, turnover, _, _, _, _ in selected
     ]
 
 
