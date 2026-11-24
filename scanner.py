@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""FALSE BREAKOUT SCANNER scheduled backend. Dynamic OKX/Gate.io scanner."""
+"""GOLD SCANNER scheduled backend. Optimized OKX/Gate.io scanner."""
 
 from __future__ import annotations
 
@@ -27,9 +27,10 @@ GATE = "https://api.gateio.ws/api/v4"
 
 STATE_FILE = Path("state.json")
 
-# Daily candles cache
+# Daily candles cache (independent to this scanner project).
 DAILY_CACHE_FILE = Path("daily_cache.json")
 DAILY_CACHE_VERSION = 1
+DAILY_CACHE_LIMIT = 700
 
 _daily_cache = {
     "version": DAILY_CACHE_VERSION,
@@ -38,9 +39,11 @@ _daily_cache = {
 }
 _daily_cache_lock = threading.Lock()
 
-# Independent 4H candles cache. This file belongs only to this scanner project.
+# Separate 4H cache. It never shares files with the first scanner project.
 FOUR_HOUR_CACHE_FILE = Path("four_hour_cache.json")
 FOUR_HOUR_CACHE_VERSION = 1
+FOUR_HOUR_CACHE_LIMIT = 240
+
 _four_hour_cache = {
     "version": FOUR_HOUR_CACHE_VERSION,
     "exchange": None,
@@ -56,17 +59,20 @@ FB = {
     "leaveAtr": 0.5
 }
 
+# Order Blocks: defaults copied from the supplied Pine Script v6 indicator.
+OB_INPUT_RANGE = 25
+OB_SHOW_BEARISH_BOS = True
+OB_SHOW_BULLISH_BOS = True
+OB_USE_MITIGATED_BLOCKS = False
+OB_MAX_DRAWN_BOXES = 50  # TradingView's default object limit when max_boxes_count is omitted.
+CHART_DAILY_CANDLES = 90
+CHART_4H_CANDLES = 72
+CHART_OB_HISTORY_CANDLES = 2000  # common maximum supported by OKX/Gate chart history retrieval
+
 TOP_UNIVERSE = 500
-# Liquidity preselection pool. Activity ranking is then calculated inside it.
+# First keep liquid contracts, then rank them by current activity.
 UNIVERSE_CANDIDATES = 1000
-# Intrabar impulse thresholds: evaluate the currently forming candle.
-# Volume and candle-body ratios are informational only; they do not block alerts.
-DAILY_IMPULSE_MIN_PCT = 50.0
-FOUR_HOUR_IMPULSE_MIN_PCT = 25.0
-IMPULSE_REPEAT_STEP_PCT = 20.0   # resend after an additional 20 percentage points
-IMPULSE_VOLUME_LOOKBACK = 20     # completed candles used for informational volume comparison
-DAILY_CHART_CANDLES = 90
-FOUR_HOUR_CHART_CANDLES = 72
+UNIVERSE_LOOKBACK_5M = 36  # 3 hours of recent activity
 MAX_MONITORED = int(os.getenv("MAX_MONITORED", "500"))
 
 SCAN_WORKERS = max(
@@ -214,18 +220,6 @@ def _okx_rows(inst_id: str, bar: str, limit: int):
     ][-limit:]
 
 
-def _okx_live_rows(inst_id: str, bar: str, limit: int):
-    """Fetch recent candles including the currently forming candle."""
-    data = get_json(
-        OKX + "/api/v5/market/candles",
-        {"instId": inst_id, "bar": bar, "limit": str(min(limit, 300))}
-    )
-    if data.get("code") != "0":
-        raise RuntimeError(f"OKX live candles {inst_id}: {data.get('msg')}")
-    rows = data.get("data", [])
-    return sorted(rows, key=lambda row: int(row[0]))
-
-
 def _gate_rows(contract: str, interval: str, limit: int):
     params = {
         "contract": contract,
@@ -319,19 +313,22 @@ def _okx_universe():
             continue
 
         try:
-            last = float(ticker.get("last") or 0)
-            turnover = float(ticker.get("volCcy24h") or 0) * last
+            last_price = float(ticker.get("last") or 0)
+            turnover = (
+                float(ticker.get("volCcy24h") or 0)
+                * last_price
+            )
             open_24h = float(ticker.get("open24h") or 0)
-            change_24h = (
-                (last / open_24h - 1.0) * 100.0
-                if last > 0 and open_24h > 0
+            change_24h_pct = (
+                (last_price / open_24h - 1.0) * 100.0
+                if open_24h > 0 and last_price > 0
                 else 0.0
             )
-        except (TypeError, ValueError, ZeroDivisionError):
+        except (TypeError, ValueError):
             continue
 
-        if turnover > 0 and last > 0:
-            items.append((sym, turnover, change_24h))
+        if turnover > 0 and last_price > 0:
+            items.append((sym, turnover, change_24h_pct))
 
     items.sort(key=lambda x: x[1], reverse=True)
     return items[:UNIVERSE_CANDIDATES]
@@ -367,128 +364,91 @@ def _gate_universe():
             continue
 
         try:
-            turnover = float(ticker.get("volume_24h_quote") or 0)
-            change_24h = float(ticker.get("change_percentage") or 0)
+            turnover = float(
+                ticker.get("volume_24h_quote") or 0
+            )
+            change_24h_pct = float(
+                ticker.get("change_percentage") or 0
+            )
         except (TypeError, ValueError):
             continue
 
         if turnover > 0:
-            items.append((sym, turnover, change_24h))
+            items.append((sym, turnover, change_24h_pct))
 
     items.sort(key=lambda x: x[1], reverse=True)
     return items[:UNIVERSE_CANDIDATES]
 
 
-def _impulse_details_current(bars, interval, min_pct=None, now_ts=None):
-    """
-    Evaluate the currently forming candle using signed open-to-current-price move.
-
-    The move threshold is the only qualification filter. Relative volume and
-    candle-body/range are calculated for context and Telegram reporting, but
-    never suppress a qualifying pump or dump.
-    """
-    if not bars:
-        return None
-
-    now_ts = int(now_ts or time.time())
-    current = bars[-1]
+def _activity_score_candidate(item):
+    """Score both upward and downward movers, emphasizing the last 3 hours."""
+    sym, turnover, change_24h_pct = item
+    recent_volatility_pct = 0.0
+    recent_range_pct = 0.0
+    recent_move_pct = 0.0
 
     try:
-        op = float(current[1])
-        high = float(current[2])
-        low = float(current[3])
-        close = float(current[4])
-        current_volume = max(0.0, float(current[5]))
-    except (TypeError, ValueError, IndexError):
-        return None
-
-    if op <= 0 or close <= 0 or high < low:
-        return None
-
-    signed_pct = (close / op - 1.0) * 100.0
-    direction = "PUMP" if signed_pct >= 0 else "DUMP"
-    move_pct = abs(signed_pct)
-    candle_range = max(0.0, high - low)
-    body = abs(close - op)
-    body_ratio = body / candle_range if candle_range > 0 else 0.0
-
-    # Informational relative-volume estimate, not an eligibility condition.
-    previous = bars[-(IMPULSE_VOLUME_LOOKBACK + 1):-1]
-    previous_volumes = []
-    for row in previous:
-        try:
-            previous_volumes.append(max(0.0, float(row[5])))
-        except (TypeError, ValueError, IndexError):
-            continue
-
-    duration = 86400 if interval == "1d" else 14400
-    elapsed = max(0.01, min(1.0, (now_ts - int(current[0])) / duration))
-    avg_volume = (
-        sum(previous_volumes) / len(previous_volumes)
-        if previous_volumes else 0.0
-    )
-    expected_volume = avg_volume * elapsed
-    relative_volume = (
-        current_volume / expected_volume
-        if expected_volume > 0 else 0.0
-    )
-
-    threshold = min_pct
-    if threshold is None:
-        threshold = (
-            DAILY_IMPULSE_MIN_PCT
-            if interval == "1d"
-            else FOUR_HOUR_IMPULSE_MIN_PCT
+        rows = get_bars(
+            ACTIVE_EXCHANGE,
+            sym,
+            "5m",
+            UNIVERSE_LOOKBACK_5M
         )
 
-    if move_pct < threshold:
-        return None
+        if len(rows) >= 12:
+            first_open = float(rows[0][1])
+            last_close = float(rows[-1][4])
+            highs = [float(row[2]) for row in rows]
+            lows = [float(row[3]) for row in rows]
 
-    return {
-        "pct": round(move_pct, 2),
-        "signed_pct": round(signed_pct, 2),
-        "direction": direction,
-        "start_time": int(current[0]),
-        "start_price": op,
-        "current_price": close,
-        "extreme_price": high if direction == "PUMP" else low,
-        "volume_ratio": round(relative_volume, 2),
-        "body_ratio": round(body_ratio, 3),
-        "candle_high": high,
-        "candle_low": low,
-        "active_candle": True
-    }
+            if first_open > 0 and last_close > 0:
+                recent_move_pct = abs(
+                    (last_close / first_open - 1.0) * 100.0
+                )
+                recent_range_pct = (
+                    (max(highs) - min(lows)) / last_close * 100.0
+                )
 
-def _measure_symbol_impulses(exchange, symbol):
-    """Measure current 1D and 4H forming-candle impulses with volume confirmation."""
-    daily = None
-    four_hour = None
-    try:
-        bars = get_live_bars(exchange, symbol, "1d", IMPULSE_VOLUME_LOOKBACK + 1)
-        daily = _impulse_details_current(bars, "1d", DAILY_IMPULSE_MIN_PCT)
+            absolute_returns = []
+            previous = None
+            for row in rows:
+                close = float(row[4])
+                if previous and previous > 0 and close > 0:
+                    absolute_returns.append(
+                        abs(close / previous - 1.0) * 100.0
+                    )
+                previous = close
+
+            recent_volatility_pct = sum(absolute_returns)
+
     except Exception as exc:
-        print(f"[UNIVERSE] {symbol}: current 1D impulse unavailable: {type(exc).__name__}: {exc}", flush=True)
-    try:
-        bars = get_live_bars(exchange, symbol, "4h", IMPULSE_VOLUME_LOOKBACK + 1)
-        four_hour = _impulse_details_current(bars, "4h", FOUR_HOUR_IMPULSE_MIN_PCT)
-    except Exception as exc:
-        print(f"[UNIVERSE] {symbol}: current 4H impulse unavailable: {type(exc).__name__}: {exc}", flush=True)
-    return daily, four_hour
+        print(
+            f"[UNIVERSE] {sym}: recent candles unavailable; "
+            f"ranking by 24h move only ({type(exc).__name__})",
+            flush=True
+        )
+
+    # Absolute values intentionally include both pumpers and dumpers.
+    # Recent 3h activity has 80% of the weight so stale 24h movers fall back.
+    score = (
+        abs(change_24h_pct) * 0.20
+        + recent_volatility_pct * 0.35
+        + recent_range_pct * 0.25
+        + recent_move_pct * 0.20
+    )
+
+    return (sym, turnover, score, change_24h_pct,
+            recent_volatility_pct, recent_range_pct, recent_move_pct)
 
 
 def build_stable_universe():
-    """
-    Return a separate liquid monitoring universe for false-breakout scanning.
-
-    Impulse qualification is deliberately independent: each monitored symbol
-    is checked for a live 1D >= 50% or 4H >= 25% move in process_symbol().
-    This prevents the impulse filter from shrinking the false-breakout universe.
-    """
+    """Build a fresh, activity-ranked USDT perpetual universe every run."""
     global ACTIVE_EXCHANGE
 
     try:
         candidates = _okx_universe()
         ACTIVE_EXCHANGE = "okx"
+
     except Exception as exc:
         print(
             f"[WARN] OKX universe unavailable; "
@@ -499,31 +459,46 @@ def build_stable_universe():
         ACTIVE_EXCHANGE = "gate"
 
     if not candidates:
-        print("[UNIVERSE] No liquid USDT perpetual contracts returned.", flush=True)
         return []
 
-    limit = min(TOP_UNIVERSE, MAX_MONITORED)
-    selected = candidates[:limit]
-
     print(
-        f"[UNIVERSE] Liquidity preselection: {len(candidates)} contracts; "
-        f"monitoring top {len(selected)} by 24h quote turnover. "
-        f"Live impulse alerts are checked independently: "
-        f"1D >= {DAILY_IMPULSE_MIN_PCT:.0f}% OR "
-        f"4H >= {FOUR_HOUR_IMPULSE_MIN_PCT:.0f}%.",
+        f"[UNIVERSE] Liquid candidates={len(candidates)}; "
+        f"ranking by 24h move + last 3h volatility/movement; "
+        f"exchange={ACTIVE_EXCHANGE}",
         flush=True
     )
 
-    if selected:
-        preview = ", ".join(
-            f"{sym}(${turnover / 1_000_000:.1f}M)"
-            for sym, turnover, _ in selected[:10]
-        )
-        print(f"[UNIVERSE] Highest-turnover monitored contracts: {preview}", flush=True)
+    scored = []
+    with ThreadPoolExecutor(max_workers=SCAN_WORKERS) as executor:
+        futures = [
+            executor.submit(_activity_score_candidate, item)
+            for item in candidates
+        ]
+        for future in as_completed(futures):
+            try:
+                scored.append(future.result())
+            except Exception as exc:
+                print(
+                    f"[UNIVERSE] candidate ranking failed: "
+                    f"{type(exc).__name__}: {exc}",
+                    flush=True
+                )
+
+    scored.sort(key=lambda x: (x[2], x[1]), reverse=True)
+    selected = scored[:min(TOP_UNIVERSE, MAX_MONITORED)]
+
+    print(
+        f"[UNIVERSE] Selected={len(selected)} of {len(candidates)}; "
+        f"top activity examples="
+        + ", ".join(
+            f"{x[0]}({x[2]:.2f})" for x in selected[:10]
+        ),
+        flush=True
+    )
 
     return [
-        (sym, turnover, None)
-        for sym, turnover, _ in selected
+        (sym, turnover, score)
+        for sym, turnover, score, *_ in selected
     ]
 
 
@@ -641,10 +616,11 @@ def get_bars(exchange, symbol, interval, limit):
 
         bar = {
             "5m": "5m",
-            "1h": "1H",
             "4h": "4H",
             "1d": "1D"
-        }.get(interval, "1D")
+        }.get(interval)
+        if bar is None:
+            raise ValueError(f"Unsupported OKX interval: {interval}")
 
         rows = _okx_rows(
             inst_id,
@@ -657,10 +633,11 @@ def get_bars(exchange, symbol, interval, limit):
     contract = _base(symbol) + "_USDT"
     gate_interval = {
         "5m": "5m",
-        "1h": "1h",
         "4h": "4h",
         "1d": "1d"
-    }.get(interval, "1d")
+    }.get(interval)
+    if gate_interval is None:
+        raise ValueError(f"Unsupported Gate.io interval: {interval}")
 
     rows = _gate_rows(
         contract,
@@ -669,27 +646,6 @@ def get_bars(exchange, symbol, interval, limit):
     )
 
     return _normalise_rows(rows, "gate")
-
-
-def get_live_bars(exchange, symbol, interval, limit):
-    """Return recent OHLCV bars including the active, not-yet-closed candle."""
-    if exchange == "okx":
-        inst_id = symbol.replace("USDT", "-USDT-SWAP")
-        bar = {"5m": "5m", "1h": "1H", "4h": "4H", "1d": "1D"}.get(interval, "1D")
-        rows = _okx_live_rows(inst_id, bar, limit)
-        return _normalise_rows(rows, "okx")
-    # Gate's futures candlestick endpoint returns the newest active bucket too.
-    return get_bars(exchange, symbol, interval, limit)
-
-
-def get_chart_bars(exchange, symbol, interval, history_limit):
-    """Historical depth plus the current live candle, de-duplicated by open time."""
-    historical = get_bars(exchange, symbol, interval, history_limit)
-    live = get_live_bars(exchange, symbol, interval, min(300, max(3, history_limit)))
-    by_time = {int(row[0]): row for row in historical}
-    for row in live:
-        by_time[int(row[0])] = row
-    return [by_time[key] for key in sorted(by_time)][-history_limit:]
 
 
 # ============================================================
@@ -761,7 +717,7 @@ def load_daily_cache(exchange):
             valid_rows.sort(key=lambda x: x[0])
 
             if valid_rows:
-                valid_symbols[symbol] = valid_rows[-700:]
+                valid_symbols[symbol] = valid_rows[-DAILY_CACHE_LIMIT:]
 
         _daily_cache = {
             "version": DAILY_CACHE_VERSION,
@@ -794,7 +750,7 @@ def get_cached_daily_bars(exchange, symbol):
         cached = _daily_cache["symbols"].get(symbol, [])
         cached = [row[:] for row in cached]
 
-    download_limit = 30 if cached else 700
+    download_limit = 30 if cached else DAILY_CACHE_LIMIT
 
     try:
         fresh = get_bars(
@@ -815,7 +771,7 @@ def get_cached_daily_bars(exchange, symbol):
         result = [
             merged[ts]
             for ts in sorted(merged)
-        ][-700:]
+        ][-DAILY_CACHE_LIMIT:]
 
         with _daily_cache_lock:
             _daily_cache["symbols"][symbol] = result
@@ -866,15 +822,16 @@ def save_daily_cache():
 
 
 # ============================================================
-# 4H CANDLES CACHE
+# FOUR-HOUR CANDLES CACHE
 # ============================================================
+
 def load_four_hour_cache(exchange):
     global _four_hour_cache
 
     if not FOUR_HOUR_CACHE_FILE.exists():
         print(
             "[CACHE] four_hour_cache.json not found; "
-            "full 4H history will be downloaded.",
+            "4H history will be downloaded.",
             flush=True
         )
         _four_hour_cache = {
@@ -895,8 +852,8 @@ def load_four_hour_cache(exchange):
             or not isinstance(data.get("symbols"), dict)
         ):
             print(
-                "[CACHE] 4H cache version or exchange mismatch; "
-                "starting with an empty cache.",
+                "[CACHE] 4H cache version/exchange mismatch; "
+                "starting empty.",
                 flush=True
             )
             _four_hour_cache = {
@@ -923,7 +880,7 @@ def load_four_hour_cache(exchange):
                     continue
             valid_rows.sort(key=lambda x: x[0])
             if valid_rows:
-                valid_symbols[symbol] = valid_rows[-700:]
+                valid_symbols[symbol] = valid_rows[-FOUR_HOUR_CACHE_LIMIT:]
 
         _four_hour_cache = {
             "version": FOUR_HOUR_CACHE_VERSION,
@@ -951,13 +908,13 @@ def get_cached_four_hour_bars(exchange, symbol):
     with _four_hour_cache_lock:
         cached = [row[:] for row in _four_hour_cache["symbols"].get(symbol, [])]
 
-    download_limit = 30 if cached else 700
+    download_limit = 30 if cached else FOUR_HOUR_CACHE_LIMIT
     try:
         fresh = get_bars(exchange, symbol, "4h", download_limit)
         merged = {int(row[0]): row for row in cached}
         for row in fresh:
             merged[int(row[0])] = row
-        result = [merged[ts] for ts in sorted(merged)][-700:]
+        result = [merged[ts] for ts in sorted(merged)][-FOUR_HOUR_CACHE_LIMIT:]
         with _four_hour_cache_lock:
             _four_hour_cache["symbols"][symbol] = result
         return result
@@ -988,20 +945,6 @@ def save_four_hour_cache():
         f"[CACHE] Saved 4H history for {len(data['symbols'])} symbols.",
         flush=True
     )
-
-
-def _bars_to_dict(rows):
-    return [
-        {
-            "time": int(k[0]),
-            "open": k[1],
-            "high": k[2],
-            "low": k[3],
-            "close": k[4],
-            "volume": k[5]
-        }
-        for k in rows
-    ]
 
 
 # ============================================================
@@ -1127,7 +1070,7 @@ def fb_events(days):
     return ev, atr
 
 
-def fb_compute(days, m5, now_ms=None):
+def fb_compute(days, m5, now_ms=None, timeframe="1D", candle_seconds=86400):
     n = len(days)
     L = FB["swing"]
 
@@ -1172,9 +1115,15 @@ def fb_compute(days, m5, now_ms=None):
                 add(Lo, "L", x, e["atr"] or 0)
 
     if m5:
-        ds = (
-            (m5[0]["time"] + 86399) // 86400
-        ) * 86400
+        if candle_seconds == 86400:
+            # Preserve the original daily alignment exactly.
+            ds = (
+                (m5[0]["time"] + candle_seconds - 1) // candle_seconds
+            ) * candle_seconds
+        else:
+            # For 4H, include the candle containing the first 5m bar;
+            # otherwise up to almost four hours of the 288-bar window is skipped.
+            ds = (m5[0]["time"] // candle_seconds) * candle_seconds
 
         k = next(
             (
@@ -1249,194 +1198,8 @@ def fb_compute(days, m5, now_ms=None):
                     "side": "H",
                     "price": x["price"],
                     "time": x["time"],
-                    "touch": b["time"]
-                })
-
-                continue
-
-            if (
-                x["st"] == 1
-                and x["touch"] < b["time"]
-                and (
-                    b["high"] >= x["price"] + D
-                    or b["low"] <= x["price"] - D
-                )
-            ):
-                x["st"] = 2
-                gone = True
-
-        for x in Lo:
-            if closed and b["close"] < x["price"]:
-                x["st"] = 2
-                gone = True
-                continue
-
-            if closed and b["low"] <= x["price"]:
-                x["st"] = 1
-                x["touch"] = b["time"]
-
-                events.append({
-                    "side": "L",
-                    "price": x["price"],
-                    "time": x["time"],
-                    "touch": b["time"]
-                })
-
-                continue
-
-            if (
-                x["st"] == 1
-                and x["touch"] < b["time"]
-                and (
-                    b["low"] <= x["price"] - D
-                    or b["high"] >= x["price"] + D
-                )
-            ):
-                x["st"] = 2
-                gone = True
-
-        if gone:
-            H = [
-                x for x in H
-                if x["st"] != 2
-            ]
-
-            Lo = [
-                x for x in Lo
-                if x["st"] != 2
-            ]
-
-    return {
-        "levels": H + Lo,
-        "events": events
-    }
-
-
-
-def fb_compute_4h(bars4h, m5, now_ms=None):
-    n = len(bars4h)
-    L = FB["swing"]
-
-    if n < L * 2 + 20:
-        return {
-            "levels": [],
-            "events": []
-        }
-
-    ev, atr = fb_events(bars4h)
-
-    H = []
-    Lo = []
-
-    def add(arr, side, it, a):
-        if any(
-            abs(x["price"] - it["price"])
-            <= a * FB["mergeAtr"]
-            for x in arr
-        ):
-            return
-
-        arr.append({
-            "side": side,
-            "price": it["price"],
-            "time": it["time"],
-            "st": 0,
-            "touch": 0
-        })
-
-        if len(arr) > 240:
-            arr.pop(0)
-
-    def add_day(i):
-        e = ev[i]
-
-        if e:
-            for x in e["h"]:
-                add(H, "H", x, e["atr"] or 0)
-
-            for x in e["l"]:
-                add(Lo, "L", x, e["atr"] or 0)
-
-    if m5:
-        ds = (
-            (m5[0]["time"] + 14399) // 14400
-        ) * 14400
-
-        k = next(
-            (
-                i for i, d in enumerate(bars4h)
-                if d["time"] >= ds
-            ),
-            -1
-        )
-
-        i_start = k if k >= 0 else n
-    else:
-        i_start = n
-
-    if i_start > n - 1:
-        i_start = n - 1
-
-    for i in range(i_start):
-        add_day(i)
-
-        H = [
-            x for x in H
-            if bars4h[i]["high"] < x["price"]
-        ]
-
-        Lo = [
-            x for x in Lo
-            if bars4h[i]["low"] > x["price"]
-        ]
-
-    events = []
-    cur = i_start
-
-    add_day(cur)
-
-    now_sec = (
-        (now_ms or int(time.time() * 1000)) / 1000
-    )
-
-    for bi, b in enumerate(m5):
-        if b["time"] < bars4h[i_start]["time"]:
-            continue
-
-        while (
-            cur + 1 < n
-            and b["time"] >= bars4h[cur + 1]["time"]
-        ):
-            cur += 1
-            add_day(cur)
-
-        closed = (
-            bi < len(m5) - 1
-            or b["time"] + 300 <= now_sec
-        )
-
-        D = FB["leaveAtr"] * (
-            atr[cur - 1] or atr[cur] or 0
-        )
-
-        gone = False
-
-        for x in H:
-            if closed and b["close"] > x["price"]:
-                x["st"] = 2
-                gone = True
-                continue
-
-            if closed and b["high"] >= x["price"]:
-                x["st"] = 1
-                x["touch"] = b["time"]
-
-                events.append({
-                    "side": "H",
-                    "price": x["price"],
-                    "time": x["time"],
                     "touch": b["time"],
-                    "timeframe": "4H"
+                    "timeframe": timeframe
                 })
 
                 continue
@@ -1467,7 +1230,7 @@ def fb_compute_4h(bars4h, m5, now_ms=None):
                     "price": x["price"],
                     "time": x["time"],
                     "touch": b["time"],
-                    "timeframe": "4H"
+                    "timeframe": timeframe
                 })
 
                 continue
@@ -1519,8 +1282,7 @@ def load_state():
     return {
         "primed": False,
         "seen": [],
-        "seeded_symbols": [],
-        "impulse_alerts": {}
+        "seeded_symbols": []
     }
 
 
@@ -1577,66 +1339,33 @@ def telegram_post(message, timeout=20):
         return False
 
 
-def _png_chunk(chunk_type, data):
-    body = chunk_type + data
-    return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+# ============================================================
+# TRADINGVIEW-STYLE ORDER BLOCK ENGINE AND PNG RENDERER
+# ============================================================
 
+def _compute_tv_order_blocks(bars, input_range=OB_INPUT_RANGE,
+                              use_mitigated_blocks=OB_USE_MITIGATED_BLOCKS):
+    """Port the supplied Pine v6 Order Blocks state machine bar-for-bar.
 
-
-# 5x7 bitmap font used for chart headers (standard library only).
-_FONT_5X7 = {
-"A":["01110","10001","10001","11111","10001","10001","10001"],
-"B":["11110","10001","10001","11110","10001","10001","11110"],
-"C":["01111","10000","10000","10000","10000","10000","01111"],
-"D":["11110","10001","10001","10001","10001","10001","11110"],
-"E":["11111","10000","10000","11110","10000","10000","11111"],
-"F":["11111","10000","10000","11110","10000","10000","10000"],
-"G":["01111","10000","10000","10111","10001","10001","01111"],
-"H":["10001","10001","10001","11111","10001","10001","10001"],
-"I":["11111","00100","00100","00100","00100","00100","11111"],
-"J":["00111","00010","00010","00010","10010","10010","01100"],
-"K":["10001","10010","10100","11000","10100","10010","10001"],
-"L":["10000","10000","10000","10000","10000","10000","11111"],
-"M":["10001","11011","10101","10101","10001","10001","10001"],
-"N":["10001","11001","10101","10011","10001","10001","10001"],
-"O":["01110","10001","10001","10001","10001","10001","01110"],
-"P":["11110","10001","10001","11110","10000","10000","10000"],
-"Q":["01110","10001","10001","10001","10101","10010","01101"],
-"R":["11110","10001","10001","11110","10100","10010","10001"],
-"S":["01111","10000","10000","01110","00001","00001","11110"],
-"T":["11111","00100","00100","00100","00100","00100","00100"],
-"U":["10001","10001","10001","10001","10001","10001","01110"],
-"V":["10001","10001","10001","10001","10001","01010","00100"],
-"W":["10001","10001","10001","10101","10101","10101","01010"],
-"X":["10001","10001","01010","00100","01010","10001","10001"],
-"Y":["10001","10001","01010","00100","00100","00100","00100"],
-"Z":["11111","00001","00010","00100","01000","10000","11111"],
-"0":["01110","10001","10011","10101","11001","10001","01110"],
-"1":["00100","01100","00100","00100","00100","00100","01110"],
-"2":["01110","10001","00001","00010","00100","01000","11111"],
-"3":["11110","00001","00001","01110","00001","00001","11110"],
-"4":["00010","00110","01010","10010","11111","00010","00010"],
-"5":["11111","10000","10000","11110","00001","00001","11110"],
-"6":["01110","10000","10000","11110","10001","10001","01110"],
-"7":["11111","00001","00010","00100","01000","01000","01000"],
-"8":["01110","10001","10001","01110","10001","10001","01110"],
-"9":["01110","10001","10001","01111","00001","00001","01110"],
-"/":["00001","00010","00100","01000","10000","00000","00000"],
-"-":["00000","00000","00000","11111","00000","00000","00000"],
-".":["00000","00000","00000","00000","00000","00110","00110"],
-":":["00000","00110","00110","00000","00110","00110","00000"],
-"|":["00100","00100","00100","00100","00100","00100","00100"],
-" ":["00000"]*7
-}
-
-
-def _order_block_zones(bars, input_range=25):
-    """Faithful Python port of the supplied Pine v6 Order Blocks core.
-
-    Uses close as both breaker sources, prior inputRange highs/lows, Pine-style
-    crossunder/crossover, original candle-tracking order, and close-based invalidation.
+    Pine defaults are retained: close as both breaker sources, 25-bar structure,
+    mitigated blocks disabled, and BOS lines enabled. Returned coordinates are
+    candle indices in the full input history.
     """
-    zones = []
+    if len(bars) <= input_range + 1:
+        return {"bullish": [], "bearish": [], "bos": []}
+
+    long_boxes = []
+    short_boxes = []
+    bos_lines = []
+    box_sequence = 0
+
+    candle_colour_mode = 0
+    bos_candle = False
+    bullish_alert = False
+    bearish_alert = False
+    short_retest = False
+    long_retest = False
+
     last_down_index = 0
     last_down = 0.0
     last_low = 0.0
@@ -1647,93 +1376,192 @@ def _order_block_zones(bars, input_range=25):
     last_high = 0.0
     last_long_index = 0
 
+    previous_structure_low = None
+    previous_structure_high = None
+    previous_close = None
+
     for i, candle in enumerate(bars):
-        op = float(candle["open"]); cl = float(candle["close"])
-        hi = float(candle["high"]); lo = float(candle["low"])
+        bos_candle = False
+        bullish_alert = False
+        bearish_alert = False
+        short_retest = False
+        long_retest = False
 
-        if i >= input_range:
-            # Pine: ta.lowest(low, inputRange)[1] / ta.highest(high, inputRange)[1]
-            prior = bars[i-input_range:i]
-            structure_low = min(float(x["low"]) for x in prior)
-            structure_high = max(float(x["high"]) for x in prior)
+        if i < input_range:
+            previous_close = float(candle["close"])
+            continue
 
-            if i >= input_range + 1:
-                prev_prior = bars[i-input_range-1:i-1]
-                prev_structure_low = min(float(x["low"]) for x in prev_prior)
-                prev_structure_high = max(float(x["high"]) for x in prev_prior)
-                prev_close = float(bars[i-1]["close"])
-                bearish_bos = prev_close >= prev_structure_low and cl < structure_low
-                bullish_bos = prev_close <= prev_structure_high and cl > structure_high
+        # Pine: ta.lowest(low, inputRange)[1] / ta.highest(high, inputRange)[1]
+        # and getStructure*Index() both inspect bars [i-inputRange, ..., i-1].
+        lows_window = [float(bars[j]["low"]) for j in range(i-input_range, i)]
+        highs_window = [float(bars[j]["high"]) for j in range(i-input_range, i)]
+        structure_low = min(lows_window)
+        structure_high = max(highs_window)
+        structure_low_idx = next(
+            j for j in range(i-input_range, i)
+            if float(bars[j]["low"]) == structure_low
+        )
+        structure_high_idx = next(
+            j for j in range(i-input_range, i)
+            if float(bars[j]["high"]) == structure_high
+        )
 
-                # Pine uses lastHigh / lastUpLow directly for bearish OB bounds.
-                if bearish_bos and (i - last_up_index) < 1000:
-                    top = last_high
-                    bottom = last_up_low
-                    if top > bottom > 0:
-                        zones.append({"kind": "BEARISH", "top": top, "bottom": bottom,
-                                      "start": int(bars[last_up_index]["time"]), "active": True})
+        close = float(candle["close"])
+        high = float(candle["high"])
+        low = float(candle["low"])
+        op = float(candle["open"])
 
-                # Pine uses lastDown / lastLow directly for bullish OB bounds.
-                if bullish_bos and (i - last_down_index) < 1000 and i > last_long_index:
-                    top = last_down
-                    bottom = last_low
-                    if top > bottom > 0:
-                        zones.append({"kind": "BULLISH", "top": top, "bottom": bottom,
-                                      "start": int(bars[last_down_index]["time"]), "active": True})
-                    last_long_index = i
+        # ta.crossunder(close, structureLow) / ta.crossover(close, structureHigh).
+        crossed_down = (
+            previous_close is not None
+            and previous_structure_low is not None
+            and close < structure_low
+            and previous_close >= previous_structure_low
+        )
+        crossed_up = (
+            previous_close is not None
+            and previous_structure_high is not None
+            and close > structure_high
+            and previous_close <= previous_structure_high
+        )
 
-        # Pine's Update Blocks section executes on every bar after BOS creation.
-        for z in zones:
-            if not z["active"]:
-                continue
-            if z["kind"] == "BEARISH" and cl > z["top"]:
-                z["active"] = False
-            elif z["kind"] == "BULLISH" and cl < z["bottom"]:
-                z["active"] = False
+        # Bearish Break of Structure: box(left=lastUpIndex, top=lastHigh, bottom=lastUpLow).
+        if crossed_down and (i - last_up_index) < 1000:
+            short_boxes.append({
+                "left": last_up_index,
+                "start": i,
+                "top": last_high,
+                "bottom": last_up_low,
+                "state": 0,
+                "direction": "bearish",
+                "sequence": box_sequence
+            })
+            box_sequence += 1
+            if OB_SHOW_BEARISH_BOS:
+                bos_lines.append({
+                    "left": structure_low_idx,
+                    "right": i,
+                    "price": structure_low,
+                    "direction": "bearish"
+                })
+            bos_candle = True
+            candle_colour_mode = 0
+            bearish_alert = True
 
-        # Exact candle-tracking sequence from the Pine source.
-        if cl < op:
-            last_down = hi
+        # Bullish Break of Structure: box(left=lastDownIndex, top=lastDown, bottom=lastLow).
+        if crossed_up and (i - last_down_index) < 1000 and i > last_long_index:
+            long_boxes.append({
+                "left": last_down_index,
+                "start": i,
+                "top": last_down,
+                "bottom": last_low,
+                "state": 0,
+                "direction": "bullish",
+                "sequence": box_sequence
+            })
+            box_sequence += 1
+            if OB_SHOW_BULLISH_BOS:
+                bos_lines.append({
+                    "left": structure_high_idx,
+                    "right": i,
+                    "price": structure_high,
+                    "direction": "bullish"
+                })
+            bos_candle = True
+            candle_colour_mode = 1
+            last_long_index = i
+            bullish_alert = True
+
+        # Update short/bearish blocks in reverse insertion order, as Pine does.
+        for j in range(len(short_boxes) - 1, -1, -1):
+            block = short_boxes[j]
+            b_top = block["top"]
+            b_bottom = block["bottom"]
+            if (high > b_bottom and low < b_bottom and i > block["start"]
+                    and block["state"] == 0 and use_mitigated_blocks):
+                block["state"] = 1
+                short_retest = True
+            if close > b_top:
+                short_boxes.pop(j)
+
+        # Update long/bullish blocks in reverse insertion order, as Pine does.
+        for j in range(len(long_boxes) - 1, -1, -1):
+            block = long_boxes[j]
+            b_top = block["top"]
+            b_bottom = block["bottom"]
+            if (low < b_top and high > b_top and i > block["start"]
+                    and block["state"] == 0 and use_mitigated_blocks):
+                block["state"] = 1
+                long_retest = True
+            if close < b_bottom:
+                long_boxes.pop(j)
+
+        # Candle Tracking is intentionally after BOS and block updates, matching Pine.
+        if close < op:
+            last_down = high
             last_down_index = i
-            last_low = lo
-        if cl > op:
-            last_up = cl
+            last_low = low
+
+        if close > op:
+            last_up = close
             last_up_index = i
             last_up_open = op
-            last_up_low = lo
-            last_high = hi
+            last_up_low = low
+            last_high = high
 
-        last_high = max(hi, last_high)
-        last_low = min(lo, last_low)
+        last_high = max(high, last_high)
+        last_low = min(low, last_low)
 
-    return [z for z in zones if z["active"]]
+        previous_close = close
+        previous_structure_low = structure_low
+        previous_structure_high = structure_high
+
+    # TradingView's default max_boxes_count is 50 in total, not 50 per direction.
+    active_boxes = sorted(long_boxes + short_boxes, key=lambda item: item["sequence"])
+    active_boxes = active_boxes[-OB_MAX_DRAWN_BOXES:]
+    return {
+        "bullish": [item for item in active_boxes if item["direction"] == "bullish"],
+        "bearish": [item for item in active_boxes if item["direction"] == "bearish"],
+        "bos": bos_lines[-50:]
+    }
 
 
-def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620, zones=None):
-    """Render candles, Pine-derived OB zones and a visible symbol/timeframe header."""
-    data = bars[-max_candles:]
-    if len(data) < 2:
+def _png_chunk(chunk_type, data):
+    body = chunk_type + data
+    return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body) & 0xffffffff)
+
+
+def render_orderblock_chart(bars, title, max_candles=90, width=1200, height=720):
+    """Render candles, active OB zones and BOS lines using standard-library PNG."""
+    if len(bars) < 2:
         raise ValueError("Not enough candles to render chart")
 
-    bg = (15, 23, 42)
-    grid = (43, 55, 75)
-    up = (22, 190, 130)
-    down = (239, 76, 86)
-    text_color = (235, 241, 250)
+    ob = _compute_tv_order_blocks(bars)
+    visible_start = max(0, len(bars) - max_candles)
+    data = bars[visible_start:]
+    if len(data) < 2:
+        raise ValueError("Not enough visible candles to render chart")
+
+    bg = (13, 19, 31)
+    grid = (38, 49, 67)
+    up = (20, 190, 130)
+    down = (235, 76, 88)
+    text_color = (215, 225, 238)
     pixels = bytearray(bg * (width * height))
 
     def pixel(x, y, color):
         if 0 <= x < width and 0 <= y < height:
-            i = (y * width + x) * 3
-            pixels[i:i+3] = bytes(color)
+            pos = (y * width + x) * 3
+            pixels[pos:pos+3] = bytes(color)
 
     def line(x1, y1, x2, y2, color, thickness=1):
         dx = abs(x2-x1); sx = 1 if x1 < x2 else -1
         dy = -abs(y2-y1); sy = 1 if y1 < y2 else -1
         err = dx + dy
         while True:
-            for ox in range(-(thickness//2), thickness//2+1):
-                for oy in range(-(thickness//2), thickness//2+1):
+            half = max(0, thickness // 2)
+            for ox in range(-half, half+1):
+                for oy in range(-half, half+1):
                     pixel(x1+ox, y1+oy, color)
             if x1 == x2 and y1 == y2:
                 break
@@ -1744,53 +1572,54 @@ def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620, 
                 err += dx; y1 += sy
 
     def rect(x1, y1, x2, y2, color):
-        for yy in range(max(0, y1), min(height, y2+1)):
-            for xx in range(max(0, x1), min(width, x2+1)):
-                pixel(xx, yy, color)
+        xa, xb = sorted((max(0, x1), min(width-1, x2)))
+        ya, yb = sorted((max(0, y1), min(height-1, y2)))
+        if xa > xb or ya > yb:
+            return
+        row = bytes(color) * (xb-xa+1)
+        for yy in range(ya, yb+1):
+            pos = (yy*width+xa)*3
+            pixels[pos:pos+len(row)] = row
 
-    def blend_rect(x1, y1, x2, y2, color, alpha=52):
-        for yy in range(max(0, y1), min(height, y2+1)):
-            for xx in range(max(0, x1), min(width, x2+1)):
-                idx = (yy * width + xx) * 3
-                for c in range(3):
-                    pixels[idx+c] = (pixels[idx+c]*(255-alpha) + color[c]*alpha)//255
+    def blend_rect(x1, y1, x2, y2, color, opacity):
+        xa, xb = max(0, min(x1, x2)), min(width-1, max(x1, x2))
+        ya, yb = max(0, min(y1, y2)), min(height-1, max(y1, y2))
+        if xa > xb or ya > yb:
+            return
+        for yy in range(ya, yb+1):
+            for xx in range(xa, xb+1):
+                pos = (yy*width+xx)*3
+                pixels[pos] = int(pixels[pos]*(1-opacity) + color[0]*opacity)
+                pixels[pos+1] = int(pixels[pos+1]*(1-opacity) + color[1]*opacity)
+                pixels[pos+2] = int(pixels[pos+2]*(1-opacity) + color[2]*opacity)
 
-    def draw_text(x, y, text, color=text_color, scale=2):
-        cursor = x
-        for ch in str(text).upper():
-            glyph = _FONT_5X7.get(ch, _FONT_5X7[" "])
-            for gy, row in enumerate(glyph):
-                for gx, bit in enumerate(row):
-                    if bit == "1":
-                        rect(cursor+gx*scale, y+gy*scale,
-                             cursor+(gx+1)*scale-1, y+(gy+1)*scale-1, color)
-            cursor += 6*scale
-        return cursor
-
-    left, right, top, bottom = 65, width-28, 92, height-48
+    left, right, top, bottom = 76, width-28, 62, height-55
     highs = [float(x["high"]) for x in data]
     lows = [float(x["low"]) for x in data]
-    visible_times = [int(x["time"]) for x in data]
+    # Include OB prices in the visible scale so active zones are not clipped vertically.
+    visible_blocks = []
+    for direction in ("bullish", "bearish"):
+        for block in ob[direction]:
+            if block["left"] < len(bars) and block["top"] > 0 and block["bottom"] > 0:
+                visible_blocks.append(block)
+                if block["left"] < len(bars) and block["left"] >= visible_start:
+                    highs.append(float(block["top"]))
+                    lows.append(float(block["bottom"]))
+                else:
+                    highs.append(float(block["top"]))
+                    lows.append(float(block["bottom"]))
     lo, hi = min(lows), max(highs)
-    relevant_zones = [
-        z for z in (zones or [])
-        if z["top"] >= lo*0.75 and z["bottom"] <= hi*1.25
-    ]
-    if relevant_zones:
-        lo = min(lo, min(z["bottom"] for z in relevant_zones))
-        hi = max(hi, max(z["top"] for z in relevant_zones))
-    pad = (hi-lo)*0.06 if hi > lo else max(abs(hi)*0.02, 0.01)
+    pad = (hi-lo)*0.07 if hi > lo else max(abs(hi)*0.02, 0.01)
     lo -= pad; hi += pad
     span = hi-lo or 1.0
 
     def yprice(value):
         return int(bottom - (value-lo)/span*(bottom-top))
 
-    # Header background and title.
-    rect(0, 0, width-1, 69, (20, 31, 51))
-    draw_text(28, 22, title, text_color, 3)
-    line(0, 70, width-1, 70, (67, 86, 115), 1)
+    step = (right-left)/len(data)
+    candle_w = max(3, min(11, int(step*0.58)))
 
+    # Grid first, then translucent OB rectangles, then BOS and candles.
     for i in range(6):
         y = top + (bottom-top)*i//5
         line(left, y, right, y, grid)
@@ -1798,43 +1627,52 @@ def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620, 
         x = left + (right-left)*i//8
         line(x, top, x, bottom, grid)
 
-    step = (right-left)/len(data)
-
-    # Draw active OB zones before candles, extending to the right edge.
-    for z in relevant_zones:
-        start_ts = int(z["start"])
-        try:
-            start_idx = next(i for i, ts in enumerate(visible_times) if ts >= start_ts)
-            x1 = int(left + start_idx*step)
-        except StopIteration:
-            x1 = left
-        y1, y2 = sorted((yprice(z["top"]), yprice(z["bottom"])))
-        if z["kind"] == "BULLISH":
-            # Pine: color.rgb(192, 230, 174, 60) -> 40% opacity.
-            zone_color = (192, 230, 174)
-            blend_rect(x1, y1, right, y2, zone_color, 102)
+    bullish_count = 0
+    bearish_count = 0
+    for block in visible_blocks:
+        block_left = max(block["left"], visible_start)
+        x1 = int(left + (block_left-visible_start)*step)
+        # Pine box.new(..., extend=extend.right): zone reaches the right edge.
+        x2 = right
+        y1 = yprice(block["top"])
+        y2 = yprice(block["bottom"])
+        if block["direction"] == "bullish":
+            bullish_count += 1
+            colour = (207, 203, 202) if block["state"] == 1 else (192, 230, 174)
+            opacity = 0.20 if block["state"] == 1 else 0.40
         else:
-            # Pine: color.rgb(219, 166, 50, 80) -> 20% opacity.
-            zone_color = (219, 166, 50)
-            blend_rect(x1, y1, right, y2, zone_color, 51)
-        # Pine's box border is fully transparent (color.new(gray, 100)).
+            bearish_count += 1
+            colour = (207, 203, 202) if block["state"] == 1 else (219, 166, 50)
+            opacity = 0.20
+        blend_rect(x1, min(y1, y2), x2, max(y1, y2), colour, opacity)
 
-    candle_w = max(3, min(10, int(step*0.58)))
+    bos_count = 0
+    for bos in ob["bos"]:
+        if bos["right"] < visible_start:
+            continue
+        x1 = int(left + (max(bos["left"], visible_start)-visible_start)*step)
+        x2 = int(left + (bos["right"]-visible_start+0.5)*step)
+        y = yprice(bos["price"])
+        colour = (230, 74, 82) if bos["direction"] == "bearish" else (45, 190, 115)
+        line(x1, y, x2, y, colour, 2)
+        bos_count += 1
+
     for i, candle in enumerate(data):
         x = int(left + (i+0.5)*step)
         op = float(candle["open"]); cl = float(candle["close"])
         high = float(candle["high"]); low = float(candle["low"])
-        color = up if cl >= op else down
-        line(x, yprice(high), x, yprice(low), color, 2)
+        colour = up if cl >= op else down
+        line(x, yprice(high), x, yprice(low), colour, 2)
         y1, y2 = sorted((yprice(op), yprice(cl)))
         if y2-y1 < 2:
             y2 = y1+2
-        rect(x-candle_w//2, y1, x+candle_w//2, y2, color)
+        rect(x-candle_w//2, y1, x+candle_w//2, y2, colour)
 
     last_price = float(data[-1]["close"])
     ylast = yprice(last_price)
     line(left, ylast, right, ylast, (235, 190, 70), 1)
 
+    # PNG encoding; no external imaging package is required on GitHub Actions.
     raw = bytearray()
     stride = width*3
     for y in range(height):
@@ -1844,120 +1682,115 @@ def render_candlestick_png(bars, title, max_candles=90, width=1100, height=620, 
     png += _png_chunk(b"IHDR", struct.pack(">2I5B", width, height, 8, 2, 0, 0, 0))
     png += _png_chunk(b"IDAT", zlib.compress(bytes(raw), 6))
     png += _png_chunk(b"IEND", b"")
-    return png
+    return png, {
+        "bullish": bullish_count,
+        "bearish": bearish_count,
+        "bos_lines": bos_count
+    }
 
 
-def send_impulse_telegram(sym, impulse_by_tf):
-    """Send one Telegram media group with one or two timeframe charts."""
+def send_telegram(sym, event, atr_pct):
+    """Send a false-breakout alert with its timeframe chart and Pine-equivalent OBs."""
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         print("[ERROR] Telegram credentials are missing", flush=True)
         return False
 
-    captions = ["🚀 <b>ОБНАРУЖЕН МОЩНЫЙ ИМПУЛЬС</b>", f"Монета: <b>{html.escape(sym)}</b>"]
-    media = []
-    files = {}
-    chart_specs = []
-    if "1D" in impulse_by_tf:
-        chart_specs.append(("1D", impulse_by_tf["1D"], DAILY_CHART_CANDLES))
-    if "4H" in impulse_by_tf:
-        chart_specs.append(("4H", impulse_by_tf["4H"], FOUR_HOUR_CHART_CANDLES))
-    for tf, detail, _count in chart_specs:
-        sign = "+" if detail["direction"] == "PUMP" else "-"
-        period_label = "ТЕКУЩАЯ ДНЕВНАЯ СВЕЧА" if tf == "1D" else "ТЕКУЩАЯ СВЕЧА 4H"
-        captions.append(
-            f"{tf} ({period_label}, текущая свеча): <b>{detail['direction']}</b> "
-            f"{sign}{detail['pct']:.1f}% | объём: x{detail.get('volume_ratio', 0):.2f}"
-        )
-
-    try:
-        for index, (tf, detail, count) in enumerate(chart_specs):
-            interval = "1d" if tf == "1D" else "4h"
-            # Load extended history so the Order Blocks engine can detect
-            # BOS events and keep zones that originated before the visible chart.
-            history_rows = get_chart_bars(ACTIVE_EXCHANGE, sym, interval, 5000)
-            history_bars = _bars_to_dict(history_rows)
-            zones = _order_block_zones(history_bars, input_range=25)
-            display_bars = history_bars[-count:]
-            chart_symbol = sym[:-4] + "/USDT" if sym.endswith("USDT") else sym
-            chart_title = f"{chart_symbol} | {tf} | ORDER BLOCKS"
-            image_bytes = render_candlestick_png(
-                history_bars, chart_title, count, zones=zones
-            )
-            filename = f"chart_{index}.png"
-            files[filename] = (filename, image_bytes, "image/png")
-            media_item = {
-                "type": "photo",
-                "media": f"attach://{filename}"
-            }
-            if index == 0:
-                media_item["caption"] = "\n".join(captions)
-                media_item["parse_mode"] = "HTML"
-            media.append(media_item)
-
-        if len(media) == 1:
-            filename, file_tuple = next(iter(files.items()))
-            url = f"https://api.telegram.org/bot{token}/sendPhoto"
-            response = requests.post(
-                url,
-                data={"chat_id": chat_id, "caption": "\n".join(captions), "parse_mode": "HTML"},
-                files={"photo": file_tuple},
-                timeout=45
-            )
-        else:
-            url = f"https://api.telegram.org/bot{token}/sendMediaGroup"
-            response = requests.post(
-                url,
-                data={"chat_id": chat_id, "media": json.dumps(media, ensure_ascii=False)},
-                files=files,
-                timeout=45
-            )
-        response.raise_for_status()
-        result = response.json()
-        if result.get("ok") is True:
-            print(f"[TELEGRAM] Impulse alert sent: {sym} ({','.join(impulse_by_tf)})", flush=True)
-            return True
-        print("[ERROR] Telegram media group rejected: " + str(result.get("description", "unknown error")), flush=True)
-        return False
-    except Exception as exc:
-        print(f"[ERROR] Impulse chart delivery failed for {sym}: {type(exc).__name__}: {exc}", flush=True)
-        return False
-
-
-def send_telegram(sym, event, atr_pct):
     side = (
         "ЛОЖНЫЙ ПРОБОЙ ВВЕРХ 🔴"
         if event["side"] == "H"
         else "ЛОЖНЫЙ ПРОБОЙ ВНИЗ 🟢"
     )
-
-    dt = time.strftime(
-        "%d.%m.%Y %H:%M UTC",
-        time.gmtime(event["touch"])
-    )
-
-    message = (
+    timeframe = event.get("timeframe", "1D")
+    timeframe_label = "1D — Дневной" if timeframe == "1D" else "4H — Четырёхчасовой"
+    dt = time.strftime("%d.%m.%Y %H:%M UTC", time.gmtime(event["touch"]))
+    caption = (
         "🟡 <b>FALSE BREAKOUT SCANNER</b>\n"
         "━━━━━━━━━━━━━━\n"
         f"Монета: <b>{html.escape(sym)}</b>\n"
         f"Сигнал: <b>{side}</b>\n"
-        f"Таймфрейм уровня: <b>{html.escape(event.get('timeframe', '1D'))}</b>\n"
+        f"Таймфрейм уровня: <b>{html.escape(timeframe_label)}</b>\n"
         f"Уровень: <code>{event['price']:.12g}</code>\n"
         f"Время свечи: {dt}\n"
         f"ATR: {atr_pct:.2f}%\n"
         f"Биржа: {ACTIVE_EXCHANGE.upper()}\n"
-        "━━━━━━━━━━━━━━"
+        "━━━━━━━━━━━━━━\n"
+        "На графике: ордерблоки и BOS по алгоритму Pine Script v6"
     )
 
-    if telegram_post(message):
+    try:
+        if timeframe == "1D":
+            with _daily_cache_lock:
+                raw = [row[:] for row in _daily_cache["symbols"].get(sym, [])]
+            interval = "1d"
+            visible_count = CHART_DAILY_CANDLES
+        else:
+            with _four_hour_cache_lock:
+                raw = [row[:] for row in _four_hour_cache["symbols"].get(sym, [])]
+            interval = "4h"
+            visible_count = CHART_4H_CANDLES
+
+        # Fetch a deeper chart-only history for the OB state machine. The scanner's
+        # signal caches are intentionally shorter; using only those would omit older
+        # still-active TradingView-style blocks. Gate.io supports up to 2000 bars and
+        # OKX is paginated by get_bars(). If the chart fetch fails, fall back to cache.
+        try:
+            chart_raw = get_bars(
+                ACTIVE_EXCHANGE, sym, interval, CHART_OB_HISTORY_CANDLES
+            )
+            if len(chart_raw) >= OB_INPUT_RANGE + 2:
+                raw = chart_raw
+        except Exception as chart_exc:
+            print(
+                f"[CHART] {sym} {timeframe}: deep history unavailable; "
+                f"using cache ({type(chart_exc).__name__}: {chart_exc})",
+                flush=True
+            )
+
+        if len(raw) < OB_INPUT_RANGE + 2:
+            raise RuntimeError(
+                f"not enough candles to calculate order blocks: {len(raw)}"
+            )
+
+        bars = _bars_to_dicts(raw)
+        png_bytes, ob_stats = render_orderblock_chart(
+            bars,
+            title=f"{sym} {timeframe}",
+            max_candles=visible_count
+        )
+
+        url = f"https://api.telegram.org/bot{token}/sendPhoto"
+        response = requests.post(
+            url,
+            data={
+                "chat_id": chat_id,
+                "caption": caption,
+                "parse_mode": "HTML"
+            },
+            files={"photo": (f"{sym}_{timeframe}_orderblocks.png", png_bytes, "image/png")},
+            timeout=60
+        )
+        response.raise_for_status()
+        result = response.json()
+        if result.get("ok") is True:
+            print(
+                f"[TELEGRAM] Sent chart+signal: {sym} {timeframe}; "
+                f"bullish_OB={ob_stats['bullish']}; bearish_OB={ob_stats['bearish']}; "
+                f"BOS={ob_stats['bos_lines']}",
+                flush=True
+            )
+            return True
+        print("[ERROR] Telegram API rejected chart: " + str(result.get("description", "unknown error")), flush=True)
+        return False
+
+    except Exception as exc:
         print(
-            f"[TELEGRAM] Sent: {sym}",
+            f"[ERROR] Chart/Telegram delivery failed for {sym} {timeframe}: "
+            f"{type(exc).__name__}: {exc}",
             flush=True
         )
-        return True
-
-    return False
+        return False
 
 
 def send_telegram_test():
@@ -1997,72 +1830,105 @@ def send_telegram_test():
 # PER-SYMBOL PROCESSING
 # ============================================================
 
+def _bars_to_dicts(raw):
+    return [
+        {
+            "time": int(k[0]),
+            "open": float(k[1]),
+            "high": float(k[2]),
+            "low": float(k[3]),
+            "close": float(k[4]),
+            "volume": float(k[5])
+        }
+        for k in raw
+    ]
+
+
+def _atr_percent(bars):
+    highs = [d["high"] for d in bars[:-1]]
+    lows = [d["low"] for d in bars[:-1]]
+    closes = [d["close"] for d in bars[:-1]]
+    atr_value = wilder_atr(highs, lows, closes, 14)
+    last_close = bars[-1]["close"] if bars else 0.0
+    return (
+        atr_value / last_close * 100.0
+        if atr_value and last_close > 0
+        else 0.0
+    )
+
+
 def process_symbol(exchange, sym, is_new_symbol, seen_snapshot):
-    """Process false-breakout levels and independently evaluate live impulse candles."""
+    """Process daily and 4H levels; evaluate both against the same 288 5m bars."""
     try:
         days_raw = get_cached_daily_bars(exchange, sym)
-        four_hour_raw = get_cached_four_hour_bars(exchange, sym)
+        try:
+            four_hours_raw = get_cached_four_hour_bars(exchange, sym)
+        except Exception as exc:
+            print(
+                f"[WARN] {sym}: 4H candles unavailable; daily scan continues. "
+                f"{type(exc).__name__}: {exc}",
+                flush=True
+            )
+            four_hours_raw = []
         m5_raw = get_bars(exchange, sym, "5m", 288)
 
-        days = _bars_to_dict(days_raw)
-        bars4h = _bars_to_dict(four_hour_raw)
-        m5 = _bars_to_dict(m5_raw)
+        days = _bars_to_dicts(days_raw)
+        four_hours = _bars_to_dicts(four_hours_raw)
+        m5 = _bars_to_dicts(m5_raw)
 
-        # Impulse alerts use the live exchange endpoint and include the active candle.
-        live_days = get_live_bars(exchange, sym, "1d", IMPULSE_VOLUME_LOOKBACK + 1)
-        live_4h = get_live_bars(exchange, sym, "4h", IMPULSE_VOLUME_LOOKBACK + 1)
-        daily_impulse = _impulse_details_current(live_days, "1d", DAILY_IMPULSE_MIN_PCT)
-        four_hour_impulse = _impulse_details_current(live_4h, "4h", FOUR_HOUR_IMPULSE_MIN_PCT)
-        impulse_data = {}
-        if daily_impulse:
-            impulse_data["1D"] = daily_impulse
-        if four_hour_impulse:
-            impulse_data["4H"] = four_hour_impulse
+        if len(days) < 60 or len(m5) < 30:
+            return (
+                sym, [], [], False,
+                f"insufficient history (daily={len(days)}, 4H={len(four_hours)}, 5m={len(m5)})"
+            )
+
+        daily_result = fb_compute(
+            days, m5, timeframe="1D", candle_seconds=86400
+        )
+
+        four_hour_result = {"levels": [], "events": []}
+        if len(four_hours) >= 60:
+            four_hour_result = fb_compute(
+                four_hours, m5, timeframe="4H", candle_seconds=14400
+            )
+        else:
+            print(
+                f"[WARN] {sym}: not enough 4H history ({len(four_hours)} candles); "
+                "4H levels skipped for this run.",
+                flush=True
+            )
 
         discovered = []
         seed_keys = []
+        all_events = [
+            (event, _atr_percent(days))
+            for event in daily_result["events"]
+        ]
+        if four_hour_result["events"]:
+            atr_4h_pct = _atr_percent(four_hours)
+            all_events.extend(
+                (event, atr_4h_pct)
+                for event in four_hour_result["events"]
+            )
 
-        # False-breakout engine requires its own history; lack of it must not
-        # suppress an otherwise valid live pump/dump notification.
-        if len(m5) >= 30:
-            if len(days) >= 60:
-                highs = [d["high"] for d in days[:-1]]
-                lows = [d["low"] for d in days[:-1]]
-                closes = [d["close"] for d in days[:-1]]
-                atr_value = wilder_atr(highs, lows, closes, 14)
-                last_close = days[-1]["close"]
-                daily_atr_pct = atr_value / last_close * 100 if atr_value and last_close > 0 else 0.0
-                daily_result = fb_compute(days, m5)
-                for event in daily_result["events"]:
-                    event.setdefault("timeframe", "1D")
-                    key = (f"{sym}|{event['timeframe']}|{event['side']}|{event['time']}|"
-                           f"{event['price']:.12g}|{event['touch']}")
-                    if is_new_symbol:
-                        seed_keys.append(key)
-                    elif key not in seen_snapshot:
-                        discovered.append((sym, event, daily_atr_pct, key))
+        for event, atr_pct in all_events:
+            key = (
+                f"{sym}|{event.get('timeframe', '1D')}|{event['side']}|"
+                f"{event['time']}|{event['price']:.12g}|{event['touch']}"
+            )
 
-            if len(bars4h) >= 60:
-                highs4 = [d["high"] for d in bars4h[:-1]]
-                lows4 = [d["low"] for d in bars4h[:-1]]
-                closes4 = [d["close"] for d in bars4h[:-1]]
-                atr4_value = wilder_atr(highs4, lows4, closes4, 14)
-                last_close4 = bars4h[-1]["close"]
-                atr4_pct = atr4_value / last_close4 * 100 if atr4_value and last_close4 > 0 else 0.0
-                four_hour_result = fb_compute_4h(bars4h, m5)
-                for event in four_hour_result["events"]:
-                    event.setdefault("timeframe", "4H")
-                    key = (f"{sym}|{event['timeframe']}|{event['side']}|{event['time']}|"
-                           f"{event['price']:.12g}|{event['touch']}")
-                    if is_new_symbol:
-                        seed_keys.append(key)
-                    elif key not in seen_snapshot:
-                        discovered.append((sym, event, atr4_pct, key))
+            if is_new_symbol:
+                seed_keys.append(key)
+            elif key not in seen_snapshot:
+                discovered.append((sym, event, atr_pct, key))
 
-        return sym, discovered, seed_keys, impulse_data, True, None
+        return sym, discovered, seed_keys, True, None
 
     except Exception as exc:
-        return sym, [], [], {}, False, f"{type(exc).__name__}: {exc}"
+        return (
+            sym, [], [], False,
+            f"{type(exc).__name__}: {exc}"
+        )
 
 
 # ============================================================
@@ -2080,10 +1946,7 @@ def main():
     )
 
     print(
-        f"[CONFIG] live_impulse_1D={DAILY_IMPULSE_MIN_PCT:.0f}%; "
-        f"live_impulse_4H={FOUR_HOUR_IMPULSE_MIN_PCT:.0f}%; "
-        "volume/body filters=informational only; "
-        f"swing={FB['swing']}; "
+        f"[CONFIG] swing={FB['swing']}; "
         f"minSwingAtr={FB['minSwingAtr']}; "
         f"max_monitored={MAX_MONITORED}; "
         f"workers={SCAN_WORKERS}; "
@@ -2107,7 +1970,7 @@ def main():
     symbols = build_stable_universe()
     exchange = ACTIVE_EXCHANGE
 
-    # Load independent daily and 4H candle caches for this scanner project.
+    # Load independent daily and 4H caches for this scanner project.
     load_daily_cache(exchange)
     load_four_hour_cache(exchange)
 
@@ -2119,14 +1982,9 @@ def main():
     )
 
     if not symbols:
-        print(
-            "[INFO] No symbols available in the selected universe; "
-            "nothing to scan. Run completed without error.",
-            flush=True
+        raise RuntimeError(
+            "No symbols available in the selected universe"
         )
-        save_daily_cache()
-        save_four_hour_cache()
-        return
 
     state = load_state()
 
@@ -2142,7 +2000,6 @@ def main():
 
     discovered = []
     seed_keys = []
-    impulse_candidates = {}
 
     successful_symbols = 0
     failed_symbols = 0
@@ -2184,7 +2041,6 @@ def main():
                     result_sym,
                     symbol_events,
                     symbol_seed_keys,
-                    symbol_impulses,
                     success,
                     error
                 ) = future.result()
@@ -2199,8 +2055,6 @@ def main():
                     seed_keys.extend(
                         symbol_seed_keys
                     )
-                    if symbol_impulses:
-                        impulse_candidates[result_sym] = symbol_impulses
 
                     seeded.add(result_sym)
 
@@ -2232,7 +2086,7 @@ def main():
                     flush=True
                 )
 
-    # Save updated daily and 4H caches after all workers have finished.
+    # Save both timeframe caches after all workers have finished.
     save_daily_cache()
     save_four_hour_cache()
 
@@ -2272,7 +2126,7 @@ def main():
         )
 
         print(
-            f"SIGNAL | {sym} | {side} | "
+            f"SIGNAL | {sym} | {event.get('timeframe', '1D')} | {side} | "
             f"level={event['price']} | "
             f"candle={dt} | "
             f"ATR%={atr_pct:.2f}",
@@ -2286,51 +2140,6 @@ def main():
         else:
             failed_count += 1
 
-    # Impulse alerts are independent from false-breakout alerts.
-    # First qualifying appearance is sent; same-direction continuation is resent
-    # only after another +20 percentage points. Direction change starts a new alert.
-    impulse_alerts = state.get("impulse_alerts", {})
-    if not isinstance(impulse_alerts, dict):
-        impulse_alerts = {}
-
-    impulse_sent_count = 0
-    impulse_failed_count = 0
-    now_ts = int(time.time())
-
-    for sym, details in sorted(impulse_candidates.items()):
-        previous = impulse_alerts.get(sym, {})
-        if not isinstance(previous, dict):
-            previous = {}
-
-        notify = {}
-        for tf, detail in details.items():
-            old = previous.get(tf, {})
-            old_pct = float(old.get("pct", 0.0)) if isinstance(old, dict) else 0.0
-            old_direction = old.get("direction") if isinstance(old, dict) else None
-            old_time = int(old.get("sent_at", 0)) if isinstance(old, dict) else 0
-            stale = old_time and (now_ts - old_time > 7 * 86400)
-            is_new = not old or stale
-            direction_changed = old_direction and old_direction != detail["direction"]
-            strengthened = detail["pct"] >= old_pct + IMPULSE_REPEAT_STEP_PCT
-            if is_new or direction_changed or strengthened:
-                notify[tf] = detail
-
-        if not notify:
-            continue
-
-        if send_impulse_telegram(sym, notify):
-            for tf, detail in notify.items():
-                previous[tf] = {
-                    "pct": detail["pct"],
-                    "direction": detail["direction"],
-                    "sent_at": now_ts
-                }
-            impulse_alerts[sym] = previous
-            impulse_sent_count += 1
-        else:
-            impulse_failed_count += 1
-
-    state["impulse_alerts"] = impulse_alerts
     state["seeded_symbols"] = sorted(seeded)
     state["seen"] = sorted(seen)[-10000:]
 
@@ -2351,8 +2160,6 @@ def main():
         f"new candidates={len(discovered)}; "
         f"telegram sent={sent_count}; "
         f"telegram failed={failed_count}; "
-        f"impulse alerts sent={impulse_sent_count}; "
-        f"impulse alerts failed={impulse_failed_count}; "
         f"exchange={exchange}; "
         f"elapsed={elapsed:.1f}s",
         flush=True
